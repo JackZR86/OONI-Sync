@@ -62,7 +62,7 @@ const SNIPPETS: CodeSnippet[] = [
 ) {
     private suspend fun processDirectory(sessionId: String, pending: PendingDirectoryEntity, exclusionPatterns: List<String>): Boolean {
         ...
-        var roomDatabaseException: Throwable? = null
+        var roomDatabaseException: Exception? = null
 
         val fullCompleted = try {
             safTreeReader.queryChildDocuments(treeUri, pending.documentId, batchSize = BATCH_SIZE) { batch ->
@@ -70,8 +70,8 @@ const SNIPPETS: CodeSnippet[] = [
                     processChildBatch(sessionId, pending, treeUri, batch, exclusionPatterns)
                 } catch (e: CancellationException) {
                     throw e
-                } catch (e: Throwable) {
-                    // Errore Room durante il batch: memorizza ed interrompe streaming SAF
+                } catch (e: Exception) {
+                    // Errore Room durante il batch: memorizza ed interrompe streaming SAF (Error JVM non intercettato)
                     roomDatabaseException = e
                     false
                 }
@@ -88,9 +88,12 @@ const SNIPPETS: CodeSnippet[] = [
             return true
         }
 
-        // Propagazione rigorosa errori Room: transazione rollbackata e directory genitore preservata
+        // Propagazione rigorosa errori Room: solleva ScanPersistenceException, transazione rollbackata e directory genitore preservata
         roomDatabaseException?.let { e ->
-            if (e is Exception) throw e else throw RuntimeException(e)
+            throw ScanPersistenceException(
+                "Errore durante la persistenza atomica del batch su Room: \${e.localizedMessage ?: e.javaClass.simpleName}",
+                e
+            )
         }
 
         if (fullCompleted) {
@@ -300,7 +303,7 @@ export default function App() {
           <div className="flex items-center gap-2 font-medium">
             <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
             <span>
-              Download avviato! File binario ZIP integro e verificato: <strong>{ZIP_BYTE_SIZE.toLocaleString()} byte</strong> ({ZIP_FILE_COUNT} file). Tutti i 68 test unitari eseguiti con successo (100% pass).
+              Download avviato! File binario ZIP integro e verificato: <strong>{ZIP_BYTE_SIZE.toLocaleString()} byte</strong> ({ZIP_FILE_COUNT} file). Tutti i 71 test unitari eseguiti con successo (100% pass).
             </span>
           </div>
           <span className="text-[11px] text-emerald-400 font-mono">SHA256: {ZIP_SHA256.substring(0, 12)}...</span>
@@ -348,7 +351,7 @@ export default function App() {
             }`}
           >
             <CheckCircle2 className="w-4 h-4" />
-            Test Suite Verificata (68/68 Superati - 100%)
+            Test Suite Verificata (71/71 Superati - 100%)
           </button>
           <button
             onClick={() => setActiveTab('compliance')}
@@ -424,10 +427,10 @@ export default function App() {
                 <div className="w-8 h-8 rounded-lg bg-purple-500/20 text-purple-400 flex items-center justify-center font-bold">
                   <Cpu className="w-4 h-4" />
                 </div>
-                <h3 className="font-semibold text-white text-sm">56 Test Unitari & APK Verificato</h3>
+                <h3 className="font-semibold text-white text-sm">71 Test Unitari & Regressione Zero</h3>
                 <p className="text-xs text-slate-400 leading-relaxed">
-                  Suite completa con <strong>56 test automatizzati passati con successo</strong> su Robolectric / Java 17.
-                  Build <code>:app:assembleDebug</code> completata (APK 16 MB).
+                  Suite completa con <strong>71 test automatizzati passati con successo</strong> (30 in <code>LocalFolderScannerTest</code>).
+                  Copertura totale di rollback Room, pause su persistenza ed esclusione multi-segmento.
                 </p>
               </div>
             </div>
@@ -550,7 +553,7 @@ export default function App() {
                   </div>
                 </div>
                 <span className="text-xs font-semibold px-3 py-1 bg-emerald-950 text-emerald-400 border border-emerald-800 rounded-full font-mono">
-                  68/68 SUPERATI (100% Pass)
+                  71/71 SUPERATI (100% Pass)
                 </span>
               </div>
 
@@ -558,7 +561,7 @@ export default function App() {
                 <div className="p-4 rounded-xl bg-slate-950/60 border border-slate-800 space-y-2">
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-bold text-white font-mono">LocalFolderScannerTest.kt</span>
-                    <span className="text-[11px] text-emerald-400 font-semibold font-mono">27/27 PASSED</span>
+                    <span className="text-[11px] text-emerald-400 font-semibold font-mono">30/30 PASSED</span>
                   </div>
                   <ul className="text-xs text-slate-400 list-disc list-inside space-y-1">
                     <li>Scansione cartella vuota e directory annidate</li>
@@ -583,6 +586,9 @@ export default function App() {
                     <li className="text-emerald-400/90 font-medium">Recupero da crash tra diverse istanze via newScanRepo.resumeScan() (test 27)</li>
                     <li className="text-emerald-400/90 font-medium">Propagazione CancellationException senza falso errore e cursore SAF chiuso (test 28)</li>
                     <li className="text-emerald-400/90 font-medium">Rollback atomico Room SQLite (insertBatchAtomically) su errore batch, propagazione eccezione, zero falsi errori e retry completato (test 29)</li>
+                    <li className="text-emerald-400/90 font-medium">Transizione a PAUSED su ScanPersistenceException, rollback atomico e ripresa con resumeScan() (test 30)</li>
+                    <li className="text-emerald-400/90 font-medium">Rifiuto di startNewScan in presenza di sessione PAUSED e conservazione coda (test 31)</li>
+                    <li className="text-emerald-400/90 font-medium">Fallimento batch intermedio (batch 2), chiusura cursore, conservazione coda e completamento al retry (test 32)</li>
                   </ul>
                 </div>
 

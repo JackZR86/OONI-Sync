@@ -6,6 +6,7 @@ import com.androidbackup.app.data.local.entity.ScanSessionStatus
 import com.androidbackup.app.data.local.entity.ScannedDocumentEntity
 import com.androidbackup.app.data.local.entity.ScanErrorEntity
 import com.androidbackup.app.data.scan.LocalFolderScanner
+import com.androidbackup.app.data.scan.ScanPersistenceException
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.sync.Mutex
@@ -111,11 +112,19 @@ class ScanRepository(
                     scanJob = null
                 }
 
-                // 2. Verifica che non rimangano sessioni nello stato RUNNING nel database
+                // 2. Verifica che non rimangano sessioni nello stato RUNNING o PAUSED nel database
                 val activeSession = scanSessionDao.getRunningOrPausedSession()
-                if (activeSession != null && activeSession.status == ScanSessionStatus.RUNNING.name) {
-                    scanSessionDao.updateStatus(activeSession.id, ScanSessionStatus.CANCELLED.name)
-                    pendingDirectoryDao.clearPendingForSession(activeSession.id)
+                if (activeSession != null) {
+                    if (activeSession.status == ScanSessionStatus.PAUSED.name) {
+                        throw IllegalStateException(
+                            "È presente una sessione di scansione in pausa (id: ${activeSession.id}). " +
+                            "Riprendere o annullare esplicitamente la sessione precedente prima di avviarne una nuova."
+                        )
+                    }
+                    if (activeSession.status == ScanSessionStatus.RUNNING.name) {
+                        scanSessionDao.updateStatus(activeSession.id, ScanSessionStatus.CANCELLED.name)
+                        pendingDirectoryDao.clearPendingForSession(activeSession.id)
+                    }
                 }
 
                 // 3. Recupera le cartelle configurate e verifica che ce ne sia almeno una accessibile
@@ -264,6 +273,14 @@ class ScanRepository(
                 scanner.runScan(sessionId, exclusions)
             } catch (e: CancellationException) {
                 // Job cancellato regolarmente
+            } catch (e: ScanPersistenceException) {
+                // Errore temporaneo di persistenza Room:
+                // porta la sessione in stato PAUSED, conservando intatta la coda pendente
+                scanSessionDao.updateStatus(
+                    sessionId = sessionId,
+                    status = ScanSessionStatus.PAUSED.name,
+                    errorMessage = "Scansione sospesa a causa di un errore temporaneo di persistenza del database. È possibile riprendere la scansione. Dettaglio: ${e.message}"
+                )
             } catch (e: Exception) {
                 scanSessionDao.updateStatus(
                     sessionId = sessionId,

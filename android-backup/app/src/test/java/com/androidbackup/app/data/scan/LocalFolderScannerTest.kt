@@ -803,4 +803,159 @@ class LocalFolderScannerTest {
         assertTrue(docs.any { it.documentId == "doc:file_in_sub" })
         assertTrue("La coda pendente deve essere completamente svuotata al termine del retry", database.pendingDirectoryDao().getPendingDirectoriesForSession(session.id).isEmpty())
     }
+
+    @Test
+    fun test30_RoomPersistenceErrorTransitionsToPausedAndResumesViaRepository() = runBlocking {
+        // A. Errore Room e retry attraverso il repository
+        // 1. Crea una struttura SAF con una directory figlia e almeno un file al suo interno
+        fakeSafTreeReader.addDirectory(treeUri, rootDocId, "doc:sub_repo", "SubRepo")
+        fakeSafTreeReader.addFile(treeUri, "doc:sub_repo", "doc:file_repo", "file_repo.txt", 350L)
+
+        // 2. Simula un errore SQLite durante l'inserimento atomico del batch, utilizzando un trigger
+        database.openHelper.writableDatabase.execSQL(
+            """
+            CREATE TRIGGER trigger_fail_repo_insert
+            BEFORE INSERT ON pending_directories
+            BEGIN
+                SELECT RAISE(ABORT, 'Simulazione fallimento SQLite durante scansione repository');
+            END;
+            """.trimIndent()
+        )
+
+        // 3. Avvia la scansione tramite ScanRepository (NON chiamando direttamente LocalFolderScanner.runScan())
+        val sessionResult = scanRepository.startNewScan()
+        assertTrue("startNewScan deve restituire successo all'avvio", sessionResult.isSuccess)
+        val session = sessionResult.getOrThrow()
+
+        // 4. Attende che la sessione transiti a PAUSED (non a FAILED) a seguito di ScanPersistenceException
+        val pausedSession = awaitSessionStatus(session.id, ScanSessionStatus.PAUSED)
+        assertEquals(ScanSessionStatus.PAUSED.name, pausedSession.status)
+        assertNotNull(pausedSession.errorMessage)
+        assertTrue(pausedSession.errorMessage!!.contains("temporaneo di persistenza", ignoreCase = true))
+
+        // 5. Verifica che la directory genitore (rootDocId) sia ancora presente in pending_directories
+        val pendingDirs = database.pendingDirectoryDao().getPendingDirectoriesForSession(session.id)
+        assertTrue("La directory genitore deve rimanere nella coda pending_directories", pendingDirs.any { it.documentId == rootDocId })
+
+        // 6. Verifica che il rollback non lasci documenti orfani in scanned_documents
+        val isSubRecorded = database.scannedDocumentDao().isDocumentRecorded(
+            sessionId = session.id,
+            folderId = configuredFolder.id,
+            documentId = "doc:sub_repo"
+        )
+        assertFalse("Il rollback atomico non deve lasciare documenti orfani", isSubRecorded)
+
+        // 7. Elimina il trigger per consentire la persistenza
+        database.openHelper.writableDatabase.execSQL("DROP TRIGGER IF EXISTS trigger_fail_repo_insert;")
+
+        // 8. Riprende la scansione attraverso resumeScan()
+        val resumeResult = scanRepository.resumeScan()
+        assertTrue("resumeScan deve avere successo", resumeResult.isSuccess)
+
+        // 9. Verifica che la sessione termini correttamente con COMPLETED
+        val completedSession = awaitSessionStatus(session.id, ScanSessionStatus.COMPLETED)
+        assertEquals(ScanSessionStatus.COMPLETED.name, completedSession.status)
+
+        // 10. Verifica che tutti i file siano presenti una sola volta e che la coda pendente sia vuota
+        assertEquals(1, completedSession.totalFiles)
+        assertEquals(350L, completedSession.knownTotalBytes)
+        val docs = database.scannedDocumentDao().getDocumentsForSession(session.id).filter { !it.isDirectory }
+        assertEquals(1, docs.size)
+        assertEquals("doc:file_repo", docs[0].documentId)
+        assertTrue("La coda pendente deve essere completamente svuotata", database.pendingDirectoryDao().getPendingDirectoriesForSession(session.id).isEmpty())
+    }
+
+    @Test
+    fun test31_StartNewScanRejectedWhenSessionIsPaused() = runBlocking {
+        // B. Nuova scansione con sessione in pausa
+        fakeSafTreeReader.addFile(treeUri, rootDocId, "doc:f_p1", "paused1.txt", 100L)
+
+        // 1. Crea una sessione e portala a PAUSED
+        val s1 = scanRepository.startNewScan().getOrThrow()
+        scanRepository.pauseScan().getOrThrow()
+
+        val pausedSession = database.scanSessionDao().getSessionById(s1.id)!!
+        assertEquals(ScanSessionStatus.PAUSED.name, pausedSession.status)
+        val initialPending = database.pendingDirectoryDao().getPendingDirectoriesForSession(s1.id)
+        assertFalse("La coda della sessione in pausa non deve essere vuota", initialPending.isEmpty())
+
+        // 2. Prova ad avviare una nuova scansione mentre esiste una sessione PAUSED
+        val newScanResult = scanRepository.startNewScan()
+        assertTrue("startNewScan deve fallire in presenza di una sessione PAUSED", newScanResult.isFailure)
+        val errorMsg = newScanResult.exceptionOrNull()?.message ?: ""
+        assertTrue(errorMsg.contains("in pausa", ignoreCase = true))
+
+        // 3. Verifica che la sessione precedente non sia stata alterata e la coda non sia stata svuotata
+        val s1After = database.scanSessionDao().getSessionById(s1.id)!!
+        assertEquals(ScanSessionStatus.PAUSED.name, s1After.status)
+        val pendingAfter = database.pendingDirectoryDao().getPendingDirectoriesForSession(s1.id)
+        assertEquals(initialPending.size, pendingAfter.size)
+
+        // 4. Verifica che sia possibile annullare esplicitamente la sessione in pausa
+        val cancelResult = scanRepository.cancelScan()
+        assertTrue("cancelScan deve avere successo", cancelResult.isSuccess)
+
+        val s1Cancelled = database.scanSessionDao().getSessionById(s1.id)!!
+        assertEquals(ScanSessionStatus.CANCELLED.name, s1Cancelled.status)
+        assertTrue("La coda della sessione annullata deve essere vuota", database.pendingDirectoryDao().getPendingDirectoriesForSession(s1.id).isEmpty())
+
+        // 5. Ora che la sessione precedente è terminata (CANCELLED), startNewScan deve riuscire regolarmente
+        val s2Result = scanRepository.startNewScan()
+        assertTrue("Una nuova scansione deve avviarsi con successo dopo l'annullamento", s2Result.isSuccess)
+        val s2 = s2Result.getOrThrow()
+        val s2Completed = awaitSessionStatus(s2.id, ScanSessionStatus.COMPLETED)
+        assertEquals(ScanSessionStatus.COMPLETED.name, s2Completed.status)
+    }
+
+    @Test
+    fun test32_IntermediateBatchRoomFailurePreservesQueueAndRollsBack() = runBlocking {
+        // Prepara una directory con 150 file: con BATCH_SIZE=100 verranno emessi 2 batch (Batch 1: 100 file, Batch 2: 50 file)
+        for (i in 1..150) {
+            fakeSafTreeReader.addFile(treeUri, rootDocId, "doc:mid_$i", "mid_$i.dat", 10L)
+        }
+
+        val session = scanner.createNewSession(folderRepository.getFolders())
+
+        // Installa un trigger che fallisce SOLO a partire dal 101-esimo inserimento (quindi sul secondo batch intermedio)
+        database.openHelper.writableDatabase.execSQL(
+            """
+            CREATE TRIGGER trigger_fail_intermediate_batch
+            BEFORE INSERT ON scanned_documents
+            WHEN (SELECT COUNT(*) FROM scanned_documents WHERE scan_session_id = '${session.id}') >= 100
+            BEGIN
+                SELECT RAISE(ABORT, 'Simulazione fallimento batch intermedio');
+            END;
+            """.trimIndent()
+        )
+
+        var caughtException = false
+        try {
+            scanner.runScan(session.id, emptyList())
+        } catch (e: ScanPersistenceException) {
+            caughtException = true
+        }
+        assertTrue("Deve essere sollevata ScanPersistenceException sul batch intermedio", caughtException)
+
+        // 1. La risorsa SAF è stata chiusa (cursor.use)
+        assertTrue("La risorsa SAF deve essere chiusa anche su fallimento intermedio", fakeSafTreeReader.isResourceClosed)
+
+        // 2. Nessun falso errore DIRECTORY_READ_ERROR registrato
+        val scanErrors = database.scanErrorDao().getErrorsForSession(session.id)
+        assertTrue("Nessun errore di lettura falso registrato per fallimento batch intermedio", scanErrors.isEmpty())
+
+        // 3. La directory genitore (rootDocId) NON deve essere stata eliminata dalla coda pendente
+        val pendingDirs = database.pendingDirectoryDao().getPendingDirectoriesForSession(session.id)
+        assertTrue("La directory non completata deve rimanere in pending_directories", pendingDirs.any { it.documentId == rootDocId })
+
+        // 4. Rimuove il trigger e rilancia la scansione
+        database.openHelper.writableDatabase.execSQL("DROP TRIGGER IF EXISTS trigger_fail_intermediate_batch;")
+
+        val retryStatus = scanner.runScan(session.id, emptyList())
+        assertEquals(ScanSessionStatus.COMPLETED, retryStatus)
+
+        val completedSession = database.scanSessionDao().getSessionById(session.id)!!
+        assertEquals(150, completedSession.totalFiles)
+        assertEquals(1500L, completedSession.knownTotalBytes)
+        assertTrue(database.pendingDirectoryDao().getPendingDirectoriesForSession(session.id).isEmpty())
+    }
 }

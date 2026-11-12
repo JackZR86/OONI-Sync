@@ -210,7 +210,7 @@ class LocalFolderScanner(
         }
 
         // 2. Interroga il provider SAF in piccoli blocchi progressivi
-        var roomDatabaseException: Throwable? = null
+        var roomDatabaseException: Exception? = null
 
         val fullCompleted = try {
             safTreeReader.queryChildDocuments(treeUri, pending.documentId, batchSize = BATCH_SIZE) { batch ->
@@ -218,8 +218,9 @@ class LocalFolderScanner(
                     processChildBatch(sessionId, pending, treeUri, batch, exclusionPatterns)
                 } catch (e: kotlinx.coroutines.CancellationException) {
                     throw e
-                } catch (e: Throwable) {
-                    // Errore Room durante il salvataggio dei batch: memorizza per propagazione ed interrompe lo streaming SAF
+                } catch (e: Exception) {
+                    // Errore Room durante il salvataggio dei batch: memorizza per propagazione ed interrompe lo streaming SAF.
+                    // Eccezioni critiche JVM (Error) non vengono intercettate.
                     roomDatabaseException = e
                     false
                 }
@@ -264,11 +265,14 @@ class LocalFolderScanner(
         }
 
         // Se si è verificato un errore Room durante il salvataggio del batch:
-        // propaga immediatamente l'eccezione. La transazione Room è già stata sottoposta a rollback,
+        // propaga ScanPersistenceException. La transazione Room è già stata sottoposta a rollback,
         // nessun falso errore DIRECTORY_READ_ERROR è stato registrato e la directory genitore (pending)
         // NON viene eliminata da pending_directories, consentendo la ripresa/retry.
         roomDatabaseException?.let { e ->
-            if (e is Exception) throw e else throw RuntimeException(e)
+            throw ScanPersistenceException(
+                "Errore durante la persistenza atomica del batch su Room: ${e.localizedMessage ?: e.javaClass.simpleName}",
+                e
+            )
         }
 
         // 3. Se tutti i figli sono stati letti ed elaborati con successo, rimuove la directory completata dalla coda

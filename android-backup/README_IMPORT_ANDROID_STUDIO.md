@@ -25,6 +25,9 @@ Questo archivio contiene l'intero progetto Android nativo aggiornato alla **Spec
   - Esplorazione deterministica BFS guidata da coda persistente SQLite `pending_directories`.
   - Elaborazione progressiva in streaming a batch controllati (`batchSize = 100`) per contenere l'uso della memoria (`maxBatchSizeEmitted <= 100`).
   - Atomicità tra inventario e coda pendente tramite transazione Room `@Transaction` (`insertBatchAtomically`). Nessun record orfano in caso di fallimento SQLite.
+  - Distinzione tra errori SAF ed errori Room tramite `ScanPersistenceException`: gli errori di scrittura Room non generano falsi `DIRECTORY_READ_ERROR`, provocano il rollback della transazione e lasciano la cartella genitore in `pending_directories`.
+  - Transizione a `PAUSED` in `ScanRepository`: in presenza di `ScanPersistenceException`, la sessione passa a `PAUSED` con messaggio esplicativo, consentendo a `resumeScan()` di completare la scansione una volta risolto il problema di persistenza.
+  - Coerenza delle sessioni in `startNewScan()`: se nel database è presente una sessione `PAUSED`, l'avvio di una nuova scansione viene rifiutato con un messaggio che richiede di riprendere o annullare esplicitamente la sessione precedente.
   - Propagazione rigorosa di `CancellationException` senza assorbimento in `catch (e: Exception)` generico: nessun falso errore `DIRECTORY_READ_ERROR`, directory pendente preservata per la ripresa e cursore SAF chiuso in modo affidabile (`cursor.use`).
   - Distinzione rigorosa tra directory vuota (0 elementi, operazione regolare) e cursore nullo (`NullCursorException`, registrata come `NULL_CURSOR` in `scan_errors`).
   - Prevenzione cicli e visite duplicate basata su `scanned_documents.isDocumentRecorded`.
@@ -41,5 +44,5 @@ Questo archivio contiene l'intero progetto Android nativo aggiornato alla **Spec
   - Indice univoco `index_scanned_documents_session_folder_doc` su `(scan_session_id, backup_folder_id, document_id)`.
   - Migrazione non distruttiva dei dati v1 e v2.
 - **Suite di Test Completa**:
-  - 68 test unitari automatizzati passati con successo (100% pass rate).
-  - 27 test dedicati in `LocalFolderScannerTest` su orchestrazione coroutine, cooperative cancel/pause, batch streaming con 250 file, chiusura cursore su `CancellationException`, rollback atomico Room SQLite e recupero cross-process post-crash.
+  - 71 test unitari automatizzati passati con successo (100% pass rate).
+  - 30 test dedicati in `LocalFolderScannerTest` su orchestrazione coroutine, cooperative cancel/pause, batch streaming con 250 file, chiusura cursore su `CancellationException`, rollback atomico Room SQLite, gestione `ScanPersistenceException`, rifiuto avvio su sessione in pausa, fallimenti su batch intermedi e recupero cross-process post-crash.
