@@ -1,0 +1,6 @@
+{
+  "name": "Android Backup - SAF & Room Persistence",
+  "description": "Applicazione nativa Android Kotlin + Jetpack Compose con Storage Access Framework (SAF) e persistenza Room v2",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
