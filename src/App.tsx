@@ -62,19 +62,35 @@ const SNIPPETS: CodeSnippet[] = [
 ) {
     private suspend fun processDirectory(sessionId: String, pending: PendingDirectoryEntity, exclusionPatterns: List<String>): Boolean {
         ...
+        var roomDatabaseException: Throwable? = null
+
         val fullCompleted = try {
             safTreeReader.queryChildDocuments(treeUri, pending.documentId, batchSize = BATCH_SIZE) { batch ->
-                processChildBatch(sessionId, pending, treeUri, batch, exclusionPatterns)
+                try {
+                    processChildBatch(sessionId, pending, treeUri, batch, exclusionPatterns)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    // Errore Room durante il batch: memorizza ed interrompe streaming SAF
+                    roomDatabaseException = e
+                    false
+                }
             }
         } catch (e: NullCursorException) {
             ...
-        } catch (e: kotlinx.coroutines.CancellationException) {
-            // Rilancia immediatamente: non registra falso errore né cancella la directory pendente
+        } catch (e: CancellationException) {
+            // Rilancia immediatamente: nessun falso errore né rimozione coda
             throw e
         } catch (e: Exception) {
+            // Errore generato esclusivamente dal provider SAF
             recordError(sessionId, pending.backupFolderId, pending.documentId, pending.treeUri, "DIRECTORY_READ_ERROR", e.message)
             pendingDirectoryDao.deletePendingDirectoryById(pending.id)
             return true
+        }
+
+        // Propagazione rigorosa errori Room: transazione rollbackata e directory genitore preservata
+        roomDatabaseException?.let { e ->
+            if (e is Exception) throw e else throw RuntimeException(e)
         }
 
         if (fullCompleted) {
@@ -566,7 +582,7 @@ export default function App() {
                     <li className="text-emerald-400/90 font-medium">Pausa durante scansione attiva tramite hook e ripresa (test 26)</li>
                     <li className="text-emerald-400/90 font-medium">Recupero da crash tra diverse istanze via newScanRepo.resumeScan() (test 27)</li>
                     <li className="text-emerald-400/90 font-medium">Propagazione CancellationException senza falso errore e cursore SAF chiuso (test 28)</li>
-                    <li className="text-emerald-400/90 font-medium">Rollback atomico Room SQLite (insertBatchAtomically) su errore pending (test 29)</li>
+                    <li className="text-emerald-400/90 font-medium">Rollback atomico Room SQLite (insertBatchAtomically) su errore batch, propagazione eccezione, zero falsi errori e retry completato (test 29)</li>
                   </ul>
                 </div>
 

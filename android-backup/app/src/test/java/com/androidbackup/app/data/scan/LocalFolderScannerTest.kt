@@ -757,13 +757,24 @@ class LocalFolderScannerTest {
         )
 
         // L'elaborazione del batch fallisce a causa del trigger su pending_directories
+        var caughtRoomException = false
         try {
             scanner.runScan(session.id, emptyList())
         } catch (e: Exception) {
-            // Eccezione attesa a seguito del fallimento della transazione Room
+            // Eccezione Room/SQLite propagata correttamente senza essere intercettata come errore SAF
+            caughtRoomException = true
         }
+        assertTrue("L'eccezione generata da Room deve propagarsi e non essere assorbita come errore SAF", caughtRoomException)
 
-        // Verifica Atomicità: a causa del rollback della transazione Room, doc:sub_fail NON deve essere
+        // 1. Nessun falso errore DIRECTORY_READ_ERROR registrato in scan_errors
+        val scanErrors = database.scanErrorDao().getErrorsForSession(session.id)
+        assertTrue("Nessun falso errore DIRECTORY_READ_ERROR deve essere registrato per errori Room: trovati ${scanErrors.size}", scanErrors.isEmpty())
+
+        // 2. La directory genitore (rootDocId) NON deve essere stata eliminata dalla coda pendente
+        val pendingDirs = database.pendingDirectoryDao().getPendingDirectoriesForSession(session.id)
+        assertTrue("La directory genitore deve rimanere nella coda pending_directories per consentire il retry", pendingDirs.any { it.documentId == rootDocId })
+
+        // 3. Verifica Atomicità: a causa del rollback della transazione Room, doc:sub_fail NON deve essere
         // rimasto registrato orfano in scanned_documents. Se fosse rimasto registrato,
         // la successiva scansione lo considererebbe già visitato e non esplorerebbe i suoi sottofile!
         val isSubRecorded = database.scannedDocumentDao().isDocumentRecorded(
@@ -776,10 +787,11 @@ class LocalFolderScannerTest {
             isSubRecorded
         )
 
-        // Rimuove il trigger per ripristinare il corretto funzionamento di SQLite
+        // 4. Rimuove il trigger per ripristinare il corretto funzionamento di SQLite
         database.openHelper.writableDatabase.execSQL("DROP TRIGGER IF EXISTS trigger_fail_pending_insert;")
 
-        // Rilancia la scansione: non essendoci documenti orfani, doc:sub_fail viene regolarmente esplorata con tutti i suoi file
+        // 5. Rilancia la scansione (retry): la directory root ancora pendente viene riesplorata,
+        // doc:sub_fail viene inserita regolarmente con tutti i suoi file e la scansione si completa con successo
         val retryStatus = scanner.runScan(session.id, emptyList())
         assertEquals(ScanSessionStatus.COMPLETED, retryStatus)
 
@@ -789,5 +801,6 @@ class LocalFolderScannerTest {
 
         val docs = database.scannedDocumentDao().getDocumentsForSession(session.id)
         assertTrue(docs.any { it.documentId == "doc:file_in_sub" })
+        assertTrue("La coda pendente deve essere completamente svuotata al termine del retry", database.pendingDirectoryDao().getPendingDirectoriesForSession(session.id).isEmpty())
     }
 }

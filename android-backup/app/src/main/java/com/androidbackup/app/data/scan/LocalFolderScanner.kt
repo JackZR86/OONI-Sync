@@ -210,9 +210,19 @@ class LocalFolderScanner(
         }
 
         // 2. Interroga il provider SAF in piccoli blocchi progressivi
+        var roomDatabaseException: Throwable? = null
+
         val fullCompleted = try {
             safTreeReader.queryChildDocuments(treeUri, pending.documentId, batchSize = BATCH_SIZE) { batch ->
-                processChildBatch(sessionId, pending, treeUri, batch, exclusionPatterns)
+                try {
+                    processChildBatch(sessionId, pending, treeUri, batch, exclusionPatterns)
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    // Errore Room durante il salvataggio dei batch: memorizza per propagazione ed interrompe lo streaming SAF
+                    roomDatabaseException = e
+                    false
+                }
             }
         } catch (e: NullCursorException) {
             recordError(
@@ -240,6 +250,7 @@ class LocalFolderScanner(
             // Rilancia immediatamente l'eccezione di cancellazione: non registra falso errore né rimuove la directory pendente
             throw e
         } catch (e: Exception) {
+            // Errore SAF durante l'interrogazione del ContentProvider
             recordError(
                 sessionId = sessionId,
                 folderId = pending.backupFolderId,
@@ -252,7 +263,15 @@ class LocalFolderScanner(
             return true
         }
 
-        // 3. Se tutti i figli sono stati letti ed elaborati, rimuove la directory completata dalla coda
+        // Se si è verificato un errore Room durante il salvataggio del batch:
+        // propaga immediatamente l'eccezione. La transazione Room è già stata sottoposta a rollback,
+        // nessun falso errore DIRECTORY_READ_ERROR è stato registrato e la directory genitore (pending)
+        // NON viene eliminata da pending_directories, consentendo la ripresa/retry.
+        roomDatabaseException?.let { e ->
+            if (e is Exception) throw e else throw RuntimeException(e)
+        }
+
+        // 3. Se tutti i figli sono stati letti ed elaborati con successo, rimuove la directory completata dalla coda
         if (fullCompleted) {
             pendingDirectoryDao.deletePendingDirectoryById(pending.id)
         }
