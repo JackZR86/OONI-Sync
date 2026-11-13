@@ -12,13 +12,13 @@ import com.androidbackup.app.data.local.entity.*
 /**
  * Database Room principale per Android Backup.
  *
- * Vincoli architetturali Fase 1B.2:
- * - Versione 3 (migrazione incrementale da v2 tramite MIGRATION_2_3)
+ * Vincoli architetturali Fase 1B.3A:
+ * - Versione 4 (migrazione incrementale non distruttiva da v3 tramite MIGRATION_3_4)
  * - File SQLite stabile: "android_backup.db"
  * - NESSUN allowMainThreadQueries() nell'ambiente di produzione
  * - NESSUN fallbackToDestructiveMigration()
- * - Preserva integralmente impostazioni v1, esclusioni v1, cartelle v2
- * - Nuove tabelle per inventario file: scan_sessions, scanned_documents, pending_directories, scan_errors
+ * - Preserva integralmente impostazioni v1, esclusioni v1, cartelle v2 e inventari/sessioni v3
+ * - Nuova tabella persistente per cache SHA-256: file_fingerprints
  */
 @Database(
     entities = [
@@ -28,9 +28,10 @@ import com.androidbackup.app.data.local.entity.*
         ScanSessionEntity::class,
         ScannedDocumentEntity::class,
         PendingDirectoryEntity::class,
-        ScanErrorEntity::class
+        ScanErrorEntity::class,
+        FileFingerprintEntity::class
     ],
-    version = 3,
+    version = 4,
     exportSchema = true
 )
 abstract class BackupDatabase : RoomDatabase() {
@@ -41,6 +42,7 @@ abstract class BackupDatabase : RoomDatabase() {
     abstract fun scannedDocumentDao(): ScannedDocumentDao
     abstract fun pendingDirectoryDao(): PendingDirectoryDao
     abstract fun scanErrorDao(): ScanErrorDao
+    abstract fun fileFingerprintDao(): FileFingerprintDao
 
     companion object {
         const val DATABASE_NAME = "android_backup.db"
@@ -176,6 +178,71 @@ abstract class BackupDatabase : RoomDatabase() {
         }
 
         /**
+         * Migrazione esplicita e non distruttiva dalla Versione 3 alla Versione 4 (Fase 1B.3A).
+         * - Crea la tabella persistente `file_fingerprints` e i relativi indici.
+         * - Estende `scanned_documents`, `scan_sessions` e `scan_errors` preservando integralmente i dati preesistenti.
+         */
+        val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // 1. Nuova tabella file_fingerprints
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `file_fingerprints` (
+                        `id` TEXT NOT NULL,
+                        `backup_folder_id` TEXT NOT NULL,
+                        `document_id` TEXT NOT NULL,
+                        `document_uri` TEXT NOT NULL,
+                        `relative_path` TEXT NOT NULL,
+                        `mime_type` TEXT,
+                        `size_bytes` INTEGER,
+                        `last_modified_timestamp` INTEGER,
+                        `computed_bytes` INTEGER NOT NULL,
+                        `sha256_hex` TEXT NOT NULL,
+                        `last_content_hashed_timestamp` INTEGER NOT NULL,
+                        `last_metadata_matched_timestamp` INTEGER NOT NULL,
+                        `last_seen_session_id` TEXT NOT NULL,
+                        PRIMARY KEY(`id`)
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS `index_file_fingerprints_folder_doc` ON `file_fingerprints` (`backup_folder_id`, `document_id`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_file_fingerprints_folder` ON `file_fingerprints` (`backup_folder_id`)"
+                )
+
+                // 2. Estensione tabella scanned_documents
+                db.execSQL("ALTER TABLE `scanned_documents` ADD COLUMN `sha256_hex` TEXT")
+                db.execSQL("ALTER TABLE `scanned_documents` ADD COLUMN `fingerprint_status` TEXT NOT NULL DEFAULT 'NOT_REQUIRED'")
+                db.execSQL("ALTER TABLE `scanned_documents` ADD COLUMN `fingerprint_error` TEXT")
+                db.execSQL("ALTER TABLE `scanned_documents` ADD COLUMN `fingerprint_timestamp` INTEGER")
+                db.execSQL("ALTER TABLE `scanned_documents` ADD COLUMN `hashed_bytes_read` INTEGER")
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_scanned_documents_session_fp_status` ON `scanned_documents` (`scan_session_id`, `fingerprint_status`, `is_directory`, `is_excluded`)"
+                )
+
+                // 3. Estensione tabella scan_sessions
+                db.execSQL("ALTER TABLE `scan_sessions` ADD COLUMN `scan_phase` TEXT NOT NULL DEFAULT 'COMPLETED'")
+                db.execSQL("ALTER TABLE `scan_sessions` ADD COLUMN `fingerprint_mode` TEXT NOT NULL DEFAULT 'INCREMENTAL'")
+                db.execSQL("ALTER TABLE `scan_sessions` ADD COLUMN `fingerprint_max_cache_age_ms` INTEGER")
+                db.execSQL("ALTER TABLE `scan_sessions` ADD COLUMN `fingerprints_total` INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE `scan_sessions` ADD COLUMN `fingerprints_computed` INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE `scan_sessions` ADD COLUMN `fingerprints_cached` INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE `scan_sessions` ADD COLUMN `fingerprints_unsupported` INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE `scan_sessions` ADD COLUMN `fingerprints_failed` INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE `scan_sessions` ADD COLUMN `fingerprints_bytes_hashed` INTEGER NOT NULL DEFAULT 0")
+
+                // 4. Estensione tabella scan_errors
+                db.execSQL("ALTER TABLE `scan_errors` ADD COLUMN `error_phase` TEXT NOT NULL DEFAULT 'DISCOVERY'")
+                db.execSQL("ALTER TABLE `scan_errors` ADD COLUMN `severity` TEXT NOT NULL DEFAULT 'ERROR'")
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_scan_errors_session_severity_phase` ON `scan_errors` (`scan_session_id`, `severity`, `error_phase`)"
+                )
+            }
+        }
+
+        /**
          * Restituisce l'istanza singleton del database SQLite con migrazioni configurate.
          */
         fun getInstance(context: Context): BackupDatabase {
@@ -185,7 +252,7 @@ abstract class BackupDatabase : RoomDatabase() {
                     BackupDatabase::class.java,
                     DATABASE_NAME
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
                     .build()
                 INSTANCE = instance
                 instance

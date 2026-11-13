@@ -20,14 +20,14 @@ import org.robolectric.annotation.Config
 import java.io.File
 
 /**
- * Test di migrazione Room Database per Android Backup (Fase 1B.2).
+ * Test di migrazione Room Database per Android Backup (Fase 1B.2 + Fase 1B.3A).
  *
  * Dimostra:
  * 1. Migrazione SQLite nativa 1 -> 2 (tabella backup_folders e indice univoco su tree_uri).
  * 2. Migrazione SQLite nativa 2 -> 3 (tabelle scan_sessions, scanned_documents, pending_directories, scan_errors con indici e vincoli).
- * 3. Preservazione integrale di tutti i dati preesistenti da v1 e v2 durante la migrazione 2 -> 3.
- * 4. Percorso completo di migrazione 1 -> 2 -> 3 aperto con successo dal runtime di Room.
- * 5. Validazione formale dello schema v3 da parte di Room e piena operatività di tutti e 6 i DAO.
+ * 3. Migrazione SQLite nativa 3 -> 4 (nuova tabella file_fingerprints ed estensione non distruttiva di scan_sessions, scanned_documents, scan_errors).
+ * 4. Preservazione integrale di tutti i dati preesistenti da v1, v2 e v3 con valori di default coerenti.
+ * 5. Percorso completo di migrazione 1 -> 2 -> 3 -> 4 aperto con successo dal runtime di Room v4 e piena operatività di tutti e 7 i DAO.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(manifest = Config.NONE)
@@ -330,7 +330,164 @@ class DatabaseMigrationTest {
     }
 
     @Test
-    fun testFullMigrationPath1To2To3OpensSuccessfullyWithRoomAndAllDaosOperate() = runBlocking {
+    fun testMigration3To4PreservesExistingDataAndCreatesFileFingerprintsWithUniqueIndex() {
+        val testTimestamp = 1732000000000L
+
+        // 1. Porta il database allo stato v3 eseguendo MIGRATION_1_2 e MIGRATION_2_3
+        BackupDatabase.MIGRATION_1_2.migrate(db)
+        BackupDatabase.MIGRATION_2_3.migrate(db)
+
+        // 2. Inserisci dati reali v1, v2 e v3 prima della migrazione v3 -> v4
+        db.execSQL(
+            """
+            INSERT INTO app_settings (
+                id, frequency, network_policy, reserve_space_mb,
+                fifo_rotation_enabled, allow_cloud_only_eviction, require_charging, last_modified_timestamp
+            ) VALUES (
+                ${AppSettingsEntity.DEFAULT_ID}, 'TWENTY_FOUR_HOURS', 'WIFI_ONLY', 350,
+                1, 0, 1, $testTimestamp
+            )
+            """.trimIndent()
+        )
+        db.execSQL("INSERT INTO exclusion_patterns (pattern, position) VALUES ('*.tmp', 0)")
+        db.execSQL(
+            """
+            INSERT INTO backup_folders (id, tree_uri, display_name, authority, added_timestamp, priority, protect_from_eviction, enabled)
+            VALUES ('folder-v3-1', 'content://test.auth/tree/photos', 'Photos', 'test.auth', $testTimestamp, 'ALTA', 1, 1)
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
+            INSERT INTO backup_folders (id, tree_uri, display_name, authority, added_timestamp, priority, protect_from_eviction, enabled)
+            VALUES ('folder-v3-2', 'content://test.auth/tree/docs', 'Docs', 'test.auth', $testTimestamp, 'NORMALE', 0, 1)
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
+            INSERT INTO scan_sessions (id, started_timestamp, completed_timestamp, status, total_files, total_directories, known_total_bytes, unknown_size_files, excluded_items, error_count, error_message)
+            VALUES ('sess-v3', 1000, 2000, 'COMPLETED', 42, 5, 987654, 0, 3, 1, 'Errore storico v3')
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
+            INSERT INTO scanned_documents (id, scan_session_id, backup_folder_id, document_id, document_uri, relative_path, display_name, mime_type, size_bytes, last_modified_timestamp, is_directory, is_excluded)
+            VALUES ('doc-v3', 'sess-v3', 'folder-v3-1', 'doc-id-1', 'content://test.auth/doc/1', 'img.jpg', 'img.jpg', 'image/jpeg', 2048, 1500, 0, 0)
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
+            INSERT INTO pending_directories (id, scan_session_id, backup_folder_id, tree_uri, document_id, relative_path, enqueue_timestamp)
+            VALUES ('pend-v3', 'sess-v3', 'folder-v3-1', 'content://test.auth/tree/photos', 'dir-sub', 'sub', 1100)
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
+            INSERT INTO scan_errors (id, scan_session_id, backup_folder_id, document_id, uri, error_type, message, timestamp)
+            VALUES ('err-v3', 'sess-v3', 'folder-v3-1', 'doc-err', 'content://test.auth/err', 'DIRECTORY_READ_ERROR', 'Errore storico discovery', 1200)
+            """.trimIndent()
+        )
+
+        // 3. Esegui MIGRATION_3_4
+        BackupDatabase.MIGRATION_3_4.migrate(db)
+
+        // 4. Verifica preservazione integrale dei record v1/v2/v3 e applicazione dei valori di default v4
+        val sessionCursor = db.query(
+            """
+            SELECT status, total_files, scan_phase, fingerprint_mode, fingerprint_max_cache_age_ms,
+                   fingerprints_total, fingerprints_computed, fingerprints_cached, fingerprints_unsupported,
+                   fingerprints_failed, fingerprints_bytes_hashed
+            FROM scan_sessions WHERE id = 'sess-v3'
+            """.trimIndent()
+        )
+        assertTrue(sessionCursor.moveToFirst())
+        assertEquals("COMPLETED", sessionCursor.getString(0))
+        assertEquals(42, sessionCursor.getInt(1))
+        assertEquals("COMPLETED", sessionCursor.getString(2))
+        assertEquals("INCREMENTAL", sessionCursor.getString(3))
+        assertTrue(sessionCursor.isNull(4))
+        assertEquals(0, sessionCursor.getInt(5))
+        assertEquals(0, sessionCursor.getInt(6))
+        assertEquals(0, sessionCursor.getInt(7))
+        assertEquals(0, sessionCursor.getInt(8))
+        assertEquals(0, sessionCursor.getInt(9))
+        assertEquals(0L, sessionCursor.getLong(10))
+        sessionCursor.close()
+
+        val docCursor = db.query(
+            """
+            SELECT display_name, sha256_hex, fingerprint_status, fingerprint_error, fingerprint_timestamp, hashed_bytes_read
+            FROM scanned_documents WHERE id = 'doc-v3'
+            """.trimIndent()
+        )
+        assertTrue(docCursor.moveToFirst())
+        assertEquals("img.jpg", docCursor.getString(0))
+        assertTrue(docCursor.isNull(1))
+        assertEquals("NOT_REQUIRED", docCursor.getString(2))
+        assertTrue(docCursor.isNull(3))
+        assertTrue(docCursor.isNull(4))
+        assertTrue(docCursor.isNull(5))
+        docCursor.close()
+
+        val errCursor = db.query("SELECT error_type, error_phase, severity FROM scan_errors WHERE id = 'err-v3'")
+        assertTrue(errCursor.moveToFirst())
+        assertEquals("DIRECTORY_READ_ERROR", errCursor.getString(0))
+        assertEquals("DISCOVERY", errCursor.getString(1))
+        assertEquals("ERROR", errCursor.getString(2))
+        errCursor.close()
+
+        // 5. Verifica tabella file_fingerprints e isolamento per (backup_folder_id, document_id)
+        db.execSQL(
+            """
+            INSERT INTO file_fingerprints (
+                id, backup_folder_id, document_id, document_uri, relative_path, mime_type,
+                size_bytes, last_modified_timestamp, computed_bytes, sha256_hex,
+                last_content_hashed_timestamp, last_metadata_matched_timestamp, last_seen_session_id
+            ) VALUES (
+                'fp-1', 'folder-v3-1', 'shared-doc-id', 'content://test.auth/doc/shared', 'img.jpg', 'image/jpeg',
+                2048, 1500, 2048, 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+                1732000000000, 1732000000000, 'sess-v3'
+            )
+            """.trimIndent()
+        )
+
+        // Stesso document_id in un'altra backup_folder_id deve essere consentito
+        db.execSQL(
+            """
+            INSERT INTO file_fingerprints (
+                id, backup_folder_id, document_id, document_uri, relative_path, mime_type,
+                size_bytes, last_modified_timestamp, computed_bytes, sha256_hex,
+                last_content_hashed_timestamp, last_metadata_matched_timestamp, last_seen_session_id
+            ) VALUES (
+                'fp-2', 'folder-v3-2', 'shared-doc-id', 'content://test.auth/doc/shared2', 'img.jpg', 'image/jpeg',
+                2048, 1500, 2048, 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+                1732000000000, 1732000000000, 'sess-v3'
+            )
+            """.trimIndent()
+        )
+
+        // Duplicato sulla medesima coppia (backup_folder_id, document_id) deve fallire per indice univoco
+        try {
+            db.execSQL(
+                """
+                INSERT INTO file_fingerprints (
+                    id, backup_folder_id, document_id, document_uri, relative_path, mime_type,
+                    size_bytes, last_modified_timestamp, computed_bytes, sha256_hex,
+                    last_content_hashed_timestamp, last_metadata_matched_timestamp, last_seen_session_id
+                ) VALUES (
+                    'fp-dup', 'folder-v3-1', 'shared-doc-id', 'content://test.auth/doc/shared', 'img.jpg', 'image/jpeg',
+                    2048, 1500, 2048, 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+                    1732000001000, 1732000001000, 'sess-v3'
+                )
+                """.trimIndent()
+            )
+            fail("L'indice univoco index_file_fingerprints_folder_doc avrebbe dovuto impedire il duplicato")
+        } catch (_: SQLiteConstraintException) {
+            assertTrue(true)
+        }
+    }
+
+    @Test
+    fun testFullMigrationPath1To2To3To4OpensSuccessfullyWithRoomV4AndAllDaosOperate() = runBlocking {
         val testTimestamp = 1730005555555L
 
         // 1. Popola i dati v1 prima della migrazione
@@ -351,13 +508,17 @@ class DatabaseMigrationTest {
         db.close()
         openHelper.close()
 
-        // 2. Apri il database v1 con Room runtime applicando MIGRATION_1_2 e MIGRATION_2_3
+        // 2. Apri il database v1 con Room runtime v4 applicando MIGRATION_1_2, MIGRATION_2_3 e MIGRATION_3_4
         val roomDb = Room.databaseBuilder(
             context,
             BackupDatabase::class.java,
             "test_migration.db"
         )
-            .addMigrations(BackupDatabase.MIGRATION_1_2, BackupDatabase.MIGRATION_2_3)
+            .addMigrations(
+                BackupDatabase.MIGRATION_1_2,
+                BackupDatabase.MIGRATION_2_3,
+                BackupDatabase.MIGRATION_3_4
+            )
             .allowMainThreadQueries()
             .build()
         roomDatabase = roomDb
@@ -456,7 +617,7 @@ class DatabaseMigrationTest {
         roomDb.pendingDirectoryDao().deletePendingDirectoryById(nextPend.id)
         assertNull(roomDb.pendingDirectoryDao().getNextPendingDirectory("sess-room-1"))
 
-        // 9. Verifica ScanErrorDao v3
+        // 9. Verifica ScanErrorDao v4 (distinzione severità ERROR / UNSUPPORTED / WARNING e fase)
         val error = ScanErrorEntity(
             id = "err-room-1",
             scanSessionId = "sess-room-1",
@@ -465,12 +626,87 @@ class DatabaseMigrationTest {
             uri = "content://bad-uri",
             errorType = "CURSOR_ERROR",
             message = "Errore cursore test",
-            timestamp = 1020L
+            timestamp = 1020L,
+            errorPhase = ScanErrorPhase.DISCOVERY.name,
+            severity = ScanErrorSeverity.ERROR.name
         )
-        roomDb.scanErrorDao().insertError(error)
+        val unsupportedNote = ScanErrorEntity(
+            id = "err-room-virtual",
+            scanSessionId = "sess-room-1",
+            backupFolderId = "room-migrated-1",
+            documentId = "virtual-doc",
+            uri = "content://virtual-uri",
+            errorType = "VIRTUAL_DOCUMENT_UNSUPPORTED",
+            message = "Documento virtuale non supportato",
+            timestamp = 1025L,
+            errorPhase = ScanErrorPhase.FINGERPRINTING.name,
+            severity = ScanErrorSeverity.UNSUPPORTED.name
+        )
+        roomDb.scanErrorDao().insertErrors(listOf(error, unsupportedNote))
         val loadedErrors = roomDb.scanErrorDao().getErrorsForSession("sess-room-1")
-        assertEquals(1, loadedErrors.size)
-        assertEquals("CURSOR_ERROR", loadedErrors[0].errorType)
-        assertEquals("Errore cursore test", loadedErrors[0].message)
+        assertEquals(2, loadedErrors.size)
+        assertEquals(1, roomDb.scanErrorDao().countErrorsForSession("sess-room-1"))
+        assertEquals(1, roomDb.scanErrorDao().countIssuesBySeverity("sess-room-1", ScanErrorSeverity.UNSUPPORTED.name))
+        assertEquals(1, roomDb.scanErrorDao().countDiscoveryErrorsForFolder("sess-room-1", "room-migrated-1"))
+
+        // 10. Verifica FileFingerprintDao v4
+        val fp1 = FileFingerprintEntity(
+            id = "fp-room-1",
+            backupFolderId = "room-migrated-1",
+            documentId = "raw-doc-1",
+            documentUri = "content://com.android.externalstorage.documents/document/raw-doc-1",
+            relativePath = "images/photo.jpg",
+            mimeType = "image/jpeg",
+            sizeBytes = 204800L,
+            lastModifiedTimestamp = 2000L,
+            computedBytes = 204800L,
+            sha256Hex = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            lastContentHashedTimestamp = 5000L,
+            lastMetadataMatchedTimestamp = 5000L,
+            lastSeenSessionId = "sess-room-1"
+        )
+        val fpStale = FileFingerprintEntity(
+            id = "fp-room-stale",
+            backupFolderId = "room-migrated-1",
+            documentId = "deleted-doc-99",
+            documentUri = "content://com.android.externalstorage.documents/document/deleted-doc-99",
+            relativePath = "images/old.jpg",
+            mimeType = "image/jpeg",
+            sizeBytes = 100L,
+            lastModifiedTimestamp = 1000L,
+            computedBytes = 100L,
+            sha256Hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            lastContentHashedTimestamp = 4000L,
+            lastMetadataMatchedTimestamp = 4000L,
+            lastSeenSessionId = "sess-old"
+        )
+        roomDb.fileFingerprintDao().upsertFingerprints(listOf(fp1, fpStale))
+
+        val fetchedFp = roomDb.fileFingerprintDao().getByFolderAndDocument("room-migrated-1", "raw-doc-1")
+        assertNotNull(fetchedFp)
+        assertEquals(fp1.sha256Hex, fetchedFp!!.sha256Hex)
+
+        // updateMetadataObservation non deve alterare lastContentHashedTimestamp
+        roomDb.fileFingerprintDao().updateMetadataObservation(
+            folderId = "room-migrated-1",
+            documentId = "raw-doc-1",
+            documentUri = "content://com.android.externalstorage.documents/document/raw-doc-1",
+            relativePath = "images/photo.jpg",
+            sessionId = "sess-room-2",
+            matchedTimestamp = 9000L
+        )
+        val updatedFp = roomDb.fileFingerprintDao().getByFolderAndDocument("room-migrated-1", "raw-doc-1")!!
+        assertEquals(5000L, updatedFp.lastContentHashedTimestamp)
+        assertEquals(9000L, updatedFp.lastMetadataMatchedTimestamp)
+        assertEquals("sess-room-2", updatedFp.lastSeenSessionId)
+
+        // deleteStaleForFolderNotInSession rimuove solo deleted-doc-99 e mantiene raw-doc-1 presente in sess-room-1
+        val deletedStale = roomDb.fileFingerprintDao().deleteStaleForFolderNotInSession("room-migrated-1", "sess-room-1")
+        assertEquals(1, deletedStale)
+        assertEquals(1, roomDb.fileFingerprintDao().countByFolder("room-migrated-1"))
+
+        val deletedByFolder = roomDb.fileFingerprintDao().deleteByFolderId("room-migrated-1")
+        assertEquals(1, deletedByFolder)
+        assertEquals(0, roomDb.fileFingerprintDao().countByFolder("room-migrated-1"))
     }
 }

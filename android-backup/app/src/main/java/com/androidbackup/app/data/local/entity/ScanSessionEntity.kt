@@ -18,13 +18,31 @@ enum class ScanSessionStatus {
 }
 
 /**
+ * Fasi della pipeline di scansione e fingerprinting (Fase 1B.3).
+ */
+enum class ScanPhase {
+    DISCOVERY,
+    FINGERPRINTING,
+    COMPLETED
+}
+
+/**
+ * Modalità di esecuzione del calcolo delle impronte SHA-256 (Fase 1B.3).
+ */
+enum class FingerprintMode {
+    INCREMENTAL,
+    FORCE_RECOMPUTE,
+    PERIODIC_REVERIFY
+}
+
+/**
  * Entità Room per la memorizzazione persistente di una sessione di scansione locale.
  *
- * Conforme alla Specifica Fase 1B.2:
+ * Conforme alla Specifica Fase 1B.2 e Fase 1B.3A:
  * - Identificativo univoco UUID.
  * - Timestamp di avvio e completamento.
- * - Stato della scansione ([ScanSessionStatus]).
- * - Statistiche aggregate: conteggio file, directory, byte conosciuti, file con dimensione sconosciuta, elementi esclusi ed errori.
+ * - Stato della scansione ([ScanSessionStatus]), fase corrente ([ScanPhase]) e modalità fingerprinting ([FingerprintMode]).
+ * - Statistiche aggregate di discovery e fingerprinting.
  * - Messaggio di errore sintetico riepilogativo.
  */
 @Entity(tableName = "scan_sessions")
@@ -61,12 +79,53 @@ data class ScanSessionEntity(
     val errorCount: Int = 0,
 
     @ColumnInfo(name = "error_message")
-    val errorMessage: String? = null
+    val errorMessage: String? = null,
+
+    @ColumnInfo(name = "scan_phase", defaultValue = "'COMPLETED'")
+    val scanPhase: String = ScanPhase.DISCOVERY.name,
+
+    @ColumnInfo(name = "fingerprint_mode", defaultValue = "'INCREMENTAL'")
+    val fingerprintMode: String = FingerprintMode.INCREMENTAL.name,
+
+    @ColumnInfo(name = "fingerprint_max_cache_age_ms")
+    val fingerprintMaxCacheAgeMs: Long? = null,
+
+    @ColumnInfo(name = "fingerprints_total", defaultValue = "0")
+    val fingerprintsTotal: Int = 0,
+
+    @ColumnInfo(name = "fingerprints_computed", defaultValue = "0")
+    val fingerprintsComputed: Int = 0,
+
+    @ColumnInfo(name = "fingerprints_cached", defaultValue = "0")
+    val fingerprintsCached: Int = 0,
+
+    @ColumnInfo(name = "fingerprints_unsupported", defaultValue = "0")
+    val fingerprintsUnsupported: Int = 0,
+
+    @ColumnInfo(name = "fingerprints_failed", defaultValue = "0")
+    val fingerprintsFailed: Int = 0,
+
+    @ColumnInfo(name = "fingerprints_bytes_hashed", defaultValue = "0")
+    val fingerprintsBytesHashed: Long = 0L
 ) {
     val sessionStatus: ScanSessionStatus
         get() = try {
             ScanSessionStatus.valueOf(status)
         } catch (e: Exception) {
             ScanSessionStatus.FAILED
+        }
+
+    val parsedScanPhase: ScanPhase
+        get() = try {
+            ScanPhase.valueOf(scanPhase)
+        } catch (e: Exception) {
+            ScanPhase.COMPLETED
+        }
+
+    val parsedFingerprintMode: FingerprintMode
+        get() = try {
+            FingerprintMode.valueOf(fingerprintMode)
+        } catch (e: Exception) {
+            FingerprintMode.INCREMENTAL
         }
 }

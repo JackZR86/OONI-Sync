@@ -7,12 +7,24 @@ import androidx.room.PrimaryKey
 import java.util.UUID
 
 /**
+ * Stati di elaborazione della fingerprint SHA-256 per singolo documento nella sessione (Fase 1B.3).
+ */
+enum class FingerprintStatus {
+    NOT_REQUIRED,
+    PENDING,
+    COMPUTED,
+    REUSED_CACHE,
+    UNSUPPORTED,
+    FAILED
+}
+
+/**
  * Entità Room per la memorizzazione dell'inventario persistente dei file e cartelle individuati durante la scansione SAF.
  *
- * Conforme alla Specifica Fase 1B.2:
+ * Conforme alla Specifica Fase 1B.2 e Fase 1B.3A:
  * - Vincolo di unicità sulla combinazione (scan_session_id, backup_folder_id, document_id) per prevenire duplicati
  * - La stessa risorsa in due diverse cartelle configurate non crea collisioni
- * - Sola lettura metadati: nessun dato di contenuto salvato
+ * - Supporto alle colonne di fingerprinting SHA-256 per la singola sessione
  * - Gestione corretta di dimensioni o date sconosciute (nullable)
  */
 @Entity(
@@ -30,6 +42,10 @@ import java.util.UUID
         Index(
             value = ["backup_folder_id"],
             name = "index_scanned_documents_folder"
+        ),
+        Index(
+            value = ["scan_session_id", "fingerprint_status", "is_directory", "is_excluded"],
+            name = "index_scanned_documents_session_fp_status"
         )
     ]
 )
@@ -69,5 +85,27 @@ data class ScannedDocumentEntity(
     val isDirectory: Boolean = false,
 
     @ColumnInfo(name = "is_excluded")
-    val isExcluded: Boolean = false
-)
+    val isExcluded: Boolean = false,
+
+    @ColumnInfo(name = "sha256_hex")
+    val sha256Hex: String? = null,
+
+    @ColumnInfo(name = "fingerprint_status", defaultValue = "'NOT_REQUIRED'")
+    val fingerprintStatus: String = FingerprintStatus.NOT_REQUIRED.name,
+
+    @ColumnInfo(name = "fingerprint_error")
+    val fingerprintError: String? = null,
+
+    @ColumnInfo(name = "fingerprint_timestamp")
+    val fingerprintTimestamp: Long? = null,
+
+    @ColumnInfo(name = "hashed_bytes_read")
+    val hashedBytesRead: Long? = null
+) {
+    val parsedFingerprintStatus: FingerprintStatus
+        get() = try {
+            FingerprintStatus.valueOf(fingerprintStatus)
+        } catch (e: Exception) {
+            FingerprintStatus.FAILED
+        }
+}
