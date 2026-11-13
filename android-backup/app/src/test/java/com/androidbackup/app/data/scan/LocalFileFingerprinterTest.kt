@@ -400,7 +400,16 @@ class LocalFileFingerprinterTest {
         assertTrue(fingerprinter.fingerprintFile(SingleFileFingerprintRequest(d1, treeUri)) is SingleFileFingerprintResult.Computed)
 
         // Anche se i metadati coincidono, lastModifiedTimestamp null rende inaffidabile il cache hit -> ricalcolo
-        val d2 = insertDocEntity("row-unrel-2", "sess-2", "doc_unreliable", docUriNullMtime, "nomtime.dat", "application/octet-stream", payload.size.toLong(), null)
+        val d2 = insertDocEntity(
+            docId = "doc_unreliable",
+            uri = docUriNullMtime,
+            relativePath = "nomtime.dat",
+            mimeType = "application/octet-stream",
+            sizeBytes = payload.size.toLong(),
+            lastModified = null,
+            id = "row-unrel-2",
+            sessId = "sess-2"
+        )
         assertTrue(fingerprinter.fingerprintFile(SingleFileFingerprintRequest(d2, treeUri)) is SingleFileFingerprintResult.Computed)
         assertEquals(2, contentReader.openStreamCount)
 
