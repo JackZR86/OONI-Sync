@@ -37,6 +37,32 @@ interface ScannedDocumentDao {
     @Query("SELECT * FROM scanned_documents WHERE scan_session_id = :sessionId AND is_directory = 0 AND is_excluded = 0 ORDER BY relative_path ASC")
     suspend fun getIncludedFilesForSession(sessionId: String): List<ScannedDocumentEntity>
 
+    @Query(
+        """
+        UPDATE scanned_documents
+        SET mime_type = :mimeType,
+            size_bytes = :sizeBytes,
+            last_modified_timestamp = :lastModifiedTimestamp,
+            sha256_hex = :sha256Hex,
+            fingerprint_status = :fingerprintStatus,
+            fingerprint_error = :fingerprintError,
+            fingerprint_timestamp = :fingerprintTimestamp,
+            hashed_bytes_read = :hashedBytesRead
+        WHERE id = :rowId
+        """
+    )
+    suspend fun updateFingerprintOutcome(
+        rowId: String,
+        mimeType: String?,
+        sizeBytes: Long?,
+        lastModifiedTimestamp: Long?,
+        sha256Hex: String?,
+        fingerprintStatus: String,
+        fingerprintError: String?,
+        fingerprintTimestamp: Long?,
+        hashedBytesRead: Long?
+    ): Int
+
     @Query("SELECT * FROM scanned_documents WHERE scan_session_id = :sessionId ORDER BY relative_path ASC")
     fun observeDocumentsForSession(sessionId: String): Flow<List<ScannedDocumentEntity>>
 

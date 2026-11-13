@@ -6,6 +6,7 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.androidbackup.app.data.local.database.BackupDatabase
 import com.androidbackup.app.data.local.entity.BackupFolderEntity
+import com.androidbackup.app.data.local.entity.FingerprintStatus
 import com.androidbackup.app.data.local.entity.ScanSessionStatus
 import com.androidbackup.app.data.model.BackupSource
 import com.androidbackup.app.data.model.Priority
@@ -960,5 +961,30 @@ class LocalFolderScannerTest {
         assertEquals(150, completedSession.totalFiles)
         assertEquals(1500L, completedSession.knownTotalBytes)
         assertTrue(database.pendingDirectoryDao().getPendingDirectories(session.id).isEmpty())
+    }
+
+    @Test
+    fun test33_DiscoverySetsPendingForIncludedFilesAndNotRequiredForDirectoriesAndExcluded() = runBlocking {
+        fakeSafTreeReader.addDirectory(treeUri, rootDocId, "doc:sub", "sub")
+        fakeSafTreeReader.addFile(treeUri, "doc:sub", "doc:incl_file", "keep.pdf", 2048L, mimeType = "application/pdf")
+        fakeSafTreeReader.addFile(treeUri, rootDocId, "doc:excl_file", "ignore.tmp", 512L)
+        fakeSafTreeReader.addDirectory(treeUri, rootDocId, "doc:excl_dir", "cache")
+
+        val session = scanner.createNewSession(folderRepository.getFolders())
+        val status = scanner.runScan(session.id, listOf("*.tmp", "cache"))
+        assertEquals(ScanSessionStatus.COMPLETED, status)
+
+        val allDocs = database.scannedDocumentDao().getDocumentsForSession(session.id)
+        val rootDoc = allDocs.first { it.documentId == rootDocId }
+        val subDirDoc = allDocs.first { it.documentId == "doc:sub" }
+        val includedFile = allDocs.first { it.documentId == "doc:incl_file" }
+        val excludedFile = allDocs.first { it.documentId == "doc:excl_file" }
+        val excludedDir = allDocs.first { it.documentId == "doc:excl_dir" }
+
+        assertEquals(FingerprintStatus.NOT_REQUIRED.name, rootDoc.fingerprintStatus)
+        assertEquals(FingerprintStatus.NOT_REQUIRED.name, subDirDoc.fingerprintStatus)
+        assertEquals(FingerprintStatus.NOT_REQUIRED.name, excludedFile.fingerprintStatus)
+        assertEquals(FingerprintStatus.NOT_REQUIRED.name, excludedDir.fingerprintStatus)
+        assertEquals(FingerprintStatus.PENDING.name, includedFile.fingerprintStatus)
     }
 }

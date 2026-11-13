@@ -115,7 +115,8 @@ class LocalFolderScanner(
                     sizeBytes = null,
                     lastModifiedTimestamp = null,
                     isDirectory = true,
-                    isExcluded = false
+                    isExcluded = false,
+                    fingerprintStatus = FingerprintStatus.NOT_REQUIRED.name
                 )
             )
         }
@@ -339,7 +340,8 @@ class LocalFolderScanner(
                         sizeBytes = child.sizeBytes,
                         lastModifiedTimestamp = child.lastModifiedTimestamp,
                         isDirectory = child.isDirectory,
-                        isExcluded = true
+                        isExcluded = true,
+                        fingerprintStatus = FingerprintStatus.NOT_REQUIRED.name
                     )
                 )
                 // Se è una directory esclusa, non la esplora ulteriormente
@@ -370,7 +372,8 @@ class LocalFolderScanner(
                             sizeBytes = null,
                             lastModifiedTimestamp = child.lastModifiedTimestamp,
                             isDirectory = true,
-                            isExcluded = false
+                            isExcluded = false,
+                            fingerprintStatus = FingerprintStatus.NOT_REQUIRED.name
                         )
                     )
 
@@ -401,7 +404,8 @@ class LocalFolderScanner(
                         sizeBytes = child.sizeBytes,
                         lastModifiedTimestamp = child.lastModifiedTimestamp,
                         isDirectory = false,
-                        isExcluded = false
+                        isExcluded = false,
+                        fingerprintStatus = FingerprintStatus.PENDING.name
                     )
                 )
             }

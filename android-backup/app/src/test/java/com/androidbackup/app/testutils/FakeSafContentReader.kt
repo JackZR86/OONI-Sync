@@ -6,6 +6,7 @@ import com.androidbackup.app.data.saf.SafDocumentMetadata
 import java.io.ByteArrayInputStream
 import java.io.IOException
 import java.io.InputStream
+import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -44,9 +45,13 @@ class FakeSafContentReader : SafContentReader {
     private val openErrors = mutableMapOf<String, Exception>()
     private val metadataMap = mutableMapOf<String, SafDocumentMetadata?>()
     private val metadataErrors = mutableMapOf<String, Exception>()
+    private val metadataSequences = mutableMapOf<String, ArrayDeque<() -> SafDocumentMetadata?>>()
 
-    val openedUris = mutableListOf<Uri>()
-    val queriedUris = mutableListOf<Uri>()
+    var onQueryMetadata: ((documentUri: Uri) -> Unit)? = null
+    var onOpenInputStream: ((documentUri: Uri) -> Unit)? = null
+
+    val openedUris: MutableList<Uri> = Collections.synchronizedList(mutableListOf())
+    val queriedUris: MutableList<Uri> = Collections.synchronizedList(mutableListOf())
 
     private val openedCount = AtomicInteger(0)
     private val closedCount = AtomicInteger(0)
@@ -89,6 +94,12 @@ class FakeSafContentReader : SafContentReader {
         metadataMap[documentUri.toString()] = metadata
     }
 
+    fun setMetadataSequence(documentUri: Uri, vararg providers: () -> SafDocumentMetadata?) {
+        val queue = ArrayDeque<() -> SafDocumentMetadata?>()
+        providers.forEach { queue.addLast(it) }
+        metadataSequences[documentUri.toString()] = queue
+    }
+
     fun setOpenInputStreamNull(documentUri: Uri) {
         streamSources[documentUri.toString()] = StreamSource.NullStream
     }
@@ -127,6 +138,7 @@ class FakeSafContentReader : SafContentReader {
 
     override fun openInputStream(documentUri: Uri): InputStream? {
         openedUris.add(documentUri)
+        onOpenInputStream?.invoke(documentUri)
         val key = documentUri.toString()
 
         openErrors[key]?.let { throw it }
@@ -158,7 +170,12 @@ class FakeSafContentReader : SafContentReader {
 
     override fun queryDocumentMetadata(documentUri: Uri): SafDocumentMetadata? {
         queriedUris.add(documentUri)
+        onQueryMetadata?.invoke(documentUri)
         val key = documentUri.toString()
+        val seq = metadataSequences[key]
+        if (seq != null && seq.isNotEmpty()) {
+            return seq.removeFirst().invoke()
+        }
         metadataErrors[key]?.let { throw it }
         return metadataMap[key]
     }
@@ -168,6 +185,9 @@ class FakeSafContentReader : SafContentReader {
         openErrors.clear()
         metadataMap.clear()
         metadataErrors.clear()
+        metadataSequences.clear()
+        onQueryMetadata = null
+        onOpenInputStream = null
         openedUris.clear()
         queriedUris.clear()
         openedCount.set(0)
