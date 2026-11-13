@@ -8,6 +8,7 @@ import androidx.room.withTransaction
 import androidx.test.core.app.ApplicationProvider
 import com.androidbackup.app.data.local.database.BackupDatabase
 import com.androidbackup.app.data.local.entity.BackupFolderEntity
+import com.androidbackup.app.data.local.entity.FingerprintMode
 import com.androidbackup.app.data.local.entity.FingerprintStatus
 import com.androidbackup.app.data.local.entity.ScanPhase
 import com.androidbackup.app.data.local.entity.ScanSessionStatus
@@ -487,7 +488,7 @@ class LocalFolderScannerTest {
             documentUri = buildDocUri("doc:stable"),
             onBlockedEntered = { enteredSecondScan.countDown() }
         )
-        scanRepository.startNewScan().getOrThrow()
+        scanRepository.startNewScan(mode = FingerprintMode.FORCE_RECOMPUTE).getOrThrow()
         assertTrue(enteredSecondScan.await(5, TimeUnit.SECONDS))
         scanRepository.cancelScan().getOrThrow()
 
