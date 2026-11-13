@@ -317,15 +317,17 @@ class LocalFolderScannerTest {
         val session1 = scanner.createNewSession(folderRepository.getFolders())
         scanner.runScan(session1.id, emptyList())
 
-        val countAfterFirst = database.scannedDocumentDao().getDocumentsForSession(session1.id).size
-        assertEquals(1, countAfterFirst)
+        val filesAfterFirst = database.scannedDocumentDao().getIncludedFilesForSession(session1.id)
+        assertEquals(1, filesAfterFirst.size)
+        assertEquals("doc:unique", filesAfterFirst[0].documentId)
 
         // Riscansione
         val session2 = scanner.createNewSession(folderRepository.getFolders())
         scanner.runScan(session2.id, emptyList())
 
-        val countAfterSecond = database.scannedDocumentDao().getDocumentsForSession(session2.id).size
-        assertEquals(1, countAfterSecond)
+        val filesAfterSecond = database.scannedDocumentDao().getIncludedFilesForSession(session2.id)
+        assertEquals(1, filesAfterSecond.size)
+        assertEquals("doc:unique", filesAfterSecond[0].documentId)
     }
 
     @Test
@@ -811,11 +813,12 @@ class LocalFolderScannerTest {
         fakeSafTreeReader.addDirectory(treeUri, rootDocId, "doc:sub_repo", "SubRepo")
         fakeSafTreeReader.addFile(treeUri, "doc:sub_repo", "doc:file_repo", "file_repo.txt", 350L)
 
-        // 2. Simula un errore SQLite durante l'inserimento atomico del batch, utilizzando un trigger
+        // 2. Simula un errore SQLite durante l'inserimento atomico del batch figlio (non durante la creazione sessione radice)
         database.openHelper.writableDatabase.execSQL(
             """
             CREATE TRIGGER trigger_fail_repo_insert
             BEFORE INSERT ON pending_directories
+            WHEN NEW.document_id = 'doc:sub_repo'
             BEGIN
                 SELECT RAISE(ABORT, 'Simulazione fallimento SQLite durante scansione repository');
             END;

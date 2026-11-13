@@ -237,13 +237,25 @@ class LocalFolderScanner(
             pendingDirectoryDao.deletePendingDirectoryById(pending.id)
             return true
         } catch (e: SecurityException) {
+            val isTreePermissionRevoked = !safPermissionManager.hasPersistedReadPermission(treeUri) ||
+                pending.relativePath.isEmpty()
+            val errorType = if (isTreePermissionRevoked) {
+                "PERMISSION_REVOKED"
+            } else {
+                "DIRECTORY_READ_ERROR"
+            }
+            val message = if (isTreePermissionRevoked) {
+                "Autorizzazione SAF negata durante la lettura: ${e.localizedMessage ?: e.javaClass.simpleName}"
+            } else {
+                "Impossibile accedere alla sottocartella '${pending.relativePath}': ${e.localizedMessage ?: e.javaClass.simpleName}"
+            }
             recordError(
                 sessionId = sessionId,
                 folderId = pending.backupFolderId,
                 docId = pending.documentId,
                 uri = "${pending.treeUri}/${pending.documentId}",
-                errorType = "PERMISSION_REVOKED",
-                message = "Autorizzazione SAF negata durante la lettura: ${e.localizedMessage ?: e.javaClass.simpleName}"
+                errorType = errorType,
+                message = message
             )
             pendingDirectoryDao.deletePendingDirectoryById(pending.id)
             return true

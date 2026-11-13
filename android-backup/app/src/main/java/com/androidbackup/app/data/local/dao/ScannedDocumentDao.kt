@@ -43,7 +43,7 @@ interface ScannedDocumentDao {
     @Query("SELECT COUNT(*) FROM scanned_documents WHERE scan_session_id = :sessionId AND is_directory = 0 AND is_excluded = 0")
     suspend fun countFilesForSession(sessionId: String): Int
 
-    @Query("SELECT COUNT(*) FROM scanned_documents WHERE scan_session_id = :sessionId AND is_directory = 1 AND is_excluded = 0")
+    @Query("SELECT COUNT(*) FROM scanned_documents WHERE scan_session_id = :sessionId AND is_directory = 1 AND is_excluded = 0 AND relative_path != ''")
     suspend fun countDirectoriesForSession(sessionId: String): Int
 
     @Query("SELECT COALESCE(SUM(size_bytes), 0) FROM scanned_documents WHERE scan_session_id = :sessionId AND is_directory = 0 AND is_excluded = 0 AND size_bytes IS NOT NULL")
@@ -59,7 +59,7 @@ interface ScannedDocumentDao {
     @Query("SELECT COUNT(*) FROM scanned_documents WHERE scan_session_id = :sessionId AND backup_folder_id = :folderId AND is_directory = 0 AND is_excluded = 0")
     suspend fun countFilesForFolder(sessionId: String, folderId: String): Int
 
-    @Query("SELECT COUNT(*) FROM scanned_documents WHERE scan_session_id = :sessionId AND backup_folder_id = :folderId AND is_directory = 1 AND is_excluded = 0")
+    @Query("SELECT COUNT(*) FROM scanned_documents WHERE scan_session_id = :sessionId AND backup_folder_id = :folderId AND is_directory = 1 AND is_excluded = 0 AND relative_path != ''")
     suspend fun countDirectoriesForFolder(sessionId: String, folderId: String): Int
 
     @Query("SELECT COALESCE(SUM(size_bytes), 0) FROM scanned_documents WHERE scan_session_id = :sessionId AND backup_folder_id = :folderId AND is_directory = 0 AND is_excluded = 0 AND size_bytes IS NOT NULL")
