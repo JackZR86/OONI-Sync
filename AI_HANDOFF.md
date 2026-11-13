@@ -64,13 +64,13 @@ Questo file è il punto di coordinamento condiviso per lo sviluppo di OONI-Sync.
 ## 5. Stato corrente e baseline ufficiale
 
 - **Fase completata e verificata:** **Fase 1B.3C — Integrazione del fingerprinting nella pipeline di scansione**.
-- **Ultimo commit ufficiale e baseline corrente (`main`):** `73b7c16537920dee3395c708360bafebef5e4431`.
+- **Commit ufficiale più recente (HEAD corrente di `main`):** `bd7a6f97bbafe5afb9edfdbe0f0cdcfe9b1c6534` (commit esclusivamente documentale su `AI_HANDOFF.md`).
+- **Baseline del codice Android verificata (non coincide con l'HEAD corrente):** `73b7c16537920dee3395c708360bafebef5e4431`. Non sono presenti modifiche applicative successive a questa baseline.
 - **Database:** Room schema v4, senza migrazioni pendenti.
-- **Stato CI (GitHub Actions Run #12 associata alla baseline):** successo.
-  - `:app:testDebugUnitTest`: 134 test superati.
-  - `:app:assembleDebug`: `BUILD SUCCESSFUL`.
-  - Artifact dei report e APK debug caricati correttamente.
-- **Avanzamento:** nessuna nuova fase di sviluppo è attualmente iniziata.
+- **Stato CI (GitHub Actions):**
+  - **Run #12** su baseline codice Android (`73b7c16537920dee3395c708360bafebef5e4431`): successo (`:app:testDebugUnitTest`: 134 test superati; `:app:assembleDebug`: `BUILD SUCCESSFUL`; artifact dei report e APK debug generati e caricati).
+  - **Run #13** sul commit documentale (`bd7a6f97bbafe5afb9edfdbe0f0cdcfe9b1c6534`): successo (test e build APK completati con successo).
+- **Avanzamento:** nessuna nuova fase di sviluppo è ancora iniziata.
 - **Prossima attività:** qualsiasi nuova attività dovrà essere preceduta da una specifica progettuale approvata.
 
 ### Riferimento storico (stato iniziale alla creazione del file — superato)
