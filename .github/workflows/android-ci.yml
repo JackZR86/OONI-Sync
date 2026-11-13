@@ -45,12 +45,12 @@ jobs:
 
       - name: Compile and run unit tests
         working-directory: android-backup
-        run: ./gradlew :app:testDebugUnitTest --no-daemon --stacktrace
+        run: bash ./gradlew :app:testDebugUnitTest --no-daemon --stacktrace
 
       - name: Build debug APK
         if: success()
         working-directory: android-backup
-        run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
+        run: bash ./gradlew :app:assembleDebug --no-daemon --stacktrace
 
       - name: Upload test reports
         if: always()
