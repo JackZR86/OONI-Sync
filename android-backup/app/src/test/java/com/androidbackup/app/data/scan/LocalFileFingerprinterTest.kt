@@ -844,7 +844,10 @@ class LocalFileFingerprinterTest {
 
             // Verifica che tutte le operazioni SAF siano girate esclusivamente sul thread di ioDispatcher
             assertTrue(observedThreadNames.isNotEmpty())
-            assertTrue("Tutte le operazioni SAF devono girare su ioDispatcher: $observedThreadNames", observedThreadNames.all { it == "fingerprinter-io-test-thread" })
+            assertTrue(
+                "Tutte le operazioni SAF devono girare su ioDispatcher: $observedThreadNames",
+                observedThreadNames.all { it.substringBefore(" @") == "fingerprinter-io-test-thread" }
+            )
 
             // Verifica ordine strettamente serializzato (prima A, poi B)
             val lastAIdx = executionEvents.indexOfLast { it.endsWith("file_a") }
