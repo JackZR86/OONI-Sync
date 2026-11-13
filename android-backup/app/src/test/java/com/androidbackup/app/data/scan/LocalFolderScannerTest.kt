@@ -449,7 +449,7 @@ class LocalFolderScannerTest {
         val s1Db = database.scanSessionDao().getSessionById(session1.id)!!
         assertEquals(ScanSessionStatus.CANCELLED.name, s1Db.status)
         // La coda pendente della sessione annullata deve essere stata eliminata
-        val pendingS1 = database.pendingDirectoryDao().getPendingDirectoriesForSession(session1.id)
+        val pendingS1 = database.pendingDirectoryDao().getPendingDirectories(session1.id)
         assertTrue("La coda pendente della sessione annullata deve essere vuota", pendingS1.isEmpty())
 
         // 3. Avvia una seconda sessione esclusivamente tramite ScanRepository
@@ -615,7 +615,7 @@ class LocalFolderScannerTest {
         assertNotNull(dbSession)
         assertEquals(ScanSessionStatus.RUNNING.name, dbSession!!.status)
 
-        val pending = database.pendingDirectoryDao().getPendingDirectoriesForSession(session.id)
+        val pending = database.pendingDirectoryDao().getPendingDirectories(session.id)
         assertEquals(1, pending.size)
         assertEquals(rootDocId, pending[0].documentId)
 
@@ -724,7 +724,7 @@ class LocalFolderScannerTest {
         assertTrue("Nessun errore di lettura falso deve essere generato su cancellazione: trovati ${errors.size}", errors.isEmpty())
 
         // 3. La directory non è stata classificata come completata e resta nella coda pendente
-        val pendingList = database.pendingDirectoryDao().getPendingDirectoriesForSession(session.id)
+        val pendingList = database.pendingDirectoryDao().getPendingDirectories(session.id)
         assertTrue("La directory non completata deve rimanere nella coda pendente", pendingList.any { it.documentId == "doc:sub_cancel" })
 
         // 4. Rimuove l'interruzione e riprende la scansione: la sessione deve completarsi con successo
@@ -771,7 +771,7 @@ class LocalFolderScannerTest {
         assertTrue("Nessun falso errore DIRECTORY_READ_ERROR deve essere registrato per errori Room: trovati ${scanErrors.size}", scanErrors.isEmpty())
 
         // 2. La directory genitore (rootDocId) NON deve essere stata eliminata dalla coda pendente
-        val pendingDirs = database.pendingDirectoryDao().getPendingDirectoriesForSession(session.id)
+        val pendingDirs = database.pendingDirectoryDao().getPendingDirectories(session.id)
         assertTrue("La directory genitore deve rimanere nella coda pending_directories per consentire il retry", pendingDirs.any { it.documentId == rootDocId })
 
         // 3. Verifica Atomicità: a causa del rollback della transazione Room, doc:sub_fail NON deve essere
@@ -801,7 +801,7 @@ class LocalFolderScannerTest {
 
         val docs = database.scannedDocumentDao().getDocumentsForSession(session.id)
         assertTrue(docs.any { it.documentId == "doc:file_in_sub" })
-        assertTrue("La coda pendente deve essere completamente svuotata al termine del retry", database.pendingDirectoryDao().getPendingDirectoriesForSession(session.id).isEmpty())
+        assertTrue("La coda pendente deve essere completamente svuotata al termine del retry", database.pendingDirectoryDao().getPendingDirectories(session.id).isEmpty())
     }
 
     @Test
@@ -834,7 +834,7 @@ class LocalFolderScannerTest {
         assertTrue(pausedSession.errorMessage!!.contains("temporaneo di persistenza", ignoreCase = true))
 
         // 5. Verifica che la directory genitore (rootDocId) sia ancora presente in pending_directories
-        val pendingDirs = database.pendingDirectoryDao().getPendingDirectoriesForSession(session.id)
+        val pendingDirs = database.pendingDirectoryDao().getPendingDirectories(session.id)
         assertTrue("La directory genitore deve rimanere nella coda pending_directories", pendingDirs.any { it.documentId == rootDocId })
 
         // 6. Verifica che il rollback non lasci documenti orfani in scanned_documents
@@ -862,7 +862,7 @@ class LocalFolderScannerTest {
         val docs = database.scannedDocumentDao().getDocumentsForSession(session.id).filter { !it.isDirectory }
         assertEquals(1, docs.size)
         assertEquals("doc:file_repo", docs[0].documentId)
-        assertTrue("La coda pendente deve essere completamente svuotata", database.pendingDirectoryDao().getPendingDirectoriesForSession(session.id).isEmpty())
+        assertTrue("La coda pendente deve essere completamente svuotata", database.pendingDirectoryDao().getPendingDirectories(session.id).isEmpty())
     }
 
     @Test
@@ -876,7 +876,7 @@ class LocalFolderScannerTest {
 
         val pausedSession = database.scanSessionDao().getSessionById(s1.id)!!
         assertEquals(ScanSessionStatus.PAUSED.name, pausedSession.status)
-        val initialPending = database.pendingDirectoryDao().getPendingDirectoriesForSession(s1.id)
+        val initialPending = database.pendingDirectoryDao().getPendingDirectories(s1.id)
         assertFalse("La coda della sessione in pausa non deve essere vuota", initialPending.isEmpty())
 
         // 2. Prova ad avviare una nuova scansione mentre esiste una sessione PAUSED
@@ -888,7 +888,7 @@ class LocalFolderScannerTest {
         // 3. Verifica che la sessione precedente non sia stata alterata e la coda non sia stata svuotata
         val s1After = database.scanSessionDao().getSessionById(s1.id)!!
         assertEquals(ScanSessionStatus.PAUSED.name, s1After.status)
-        val pendingAfter = database.pendingDirectoryDao().getPendingDirectoriesForSession(s1.id)
+        val pendingAfter = database.pendingDirectoryDao().getPendingDirectories(s1.id)
         assertEquals(initialPending.size, pendingAfter.size)
 
         // 4. Verifica che sia possibile annullare esplicitamente la sessione in pausa
@@ -897,7 +897,7 @@ class LocalFolderScannerTest {
 
         val s1Cancelled = database.scanSessionDao().getSessionById(s1.id)!!
         assertEquals(ScanSessionStatus.CANCELLED.name, s1Cancelled.status)
-        assertTrue("La coda della sessione annullata deve essere vuota", database.pendingDirectoryDao().getPendingDirectoriesForSession(s1.id).isEmpty())
+        assertTrue("La coda della sessione annullata deve essere vuota", database.pendingDirectoryDao().getPendingDirectories(s1.id).isEmpty())
 
         // 5. Ora che la sessione precedente è terminata (CANCELLED), startNewScan deve riuscire regolarmente
         val s2Result = scanRepository.startNewScan()
@@ -944,7 +944,7 @@ class LocalFolderScannerTest {
         assertTrue("Nessun errore di lettura falso registrato per fallimento batch intermedio", scanErrors.isEmpty())
 
         // 3. La directory genitore (rootDocId) NON deve essere stata eliminata dalla coda pendente
-        val pendingDirs = database.pendingDirectoryDao().getPendingDirectoriesForSession(session.id)
+        val pendingDirs = database.pendingDirectoryDao().getPendingDirectories(session.id)
         assertTrue("La directory non completata deve rimanere in pending_directories", pendingDirs.any { it.documentId == rootDocId })
 
         // 4. Rimuove il trigger e rilancia la scansione
@@ -956,6 +956,6 @@ class LocalFolderScannerTest {
         val completedSession = database.scanSessionDao().getSessionById(session.id)!!
         assertEquals(150, completedSession.totalFiles)
         assertEquals(1500L, completedSession.knownTotalBytes)
-        assertTrue(database.pendingDirectoryDao().getPendingDirectoriesForSession(session.id).isEmpty())
+        assertTrue(database.pendingDirectoryDao().getPendingDirectories(session.id).isEmpty())
     }
 }
