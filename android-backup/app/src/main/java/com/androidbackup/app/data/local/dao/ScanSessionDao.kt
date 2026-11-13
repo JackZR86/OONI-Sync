@@ -102,6 +102,75 @@ interface ScanSessionDao {
         errorCount: Int
     )
 
+    @Query("UPDATE scan_sessions SET scan_phase = :scanPhase WHERE id = :sessionId")
+    suspend fun updatePhase(sessionId: String, scanPhase: String)
+
+    @Query(
+        """
+        UPDATE scan_sessions
+        SET fingerprints_total = :fingerprintsTotal,
+            fingerprints_computed = :fingerprintsComputed,
+            fingerprints_cached = :fingerprintsCached,
+            fingerprints_unsupported = :fingerprintsUnsupported,
+            fingerprints_failed = :fingerprintsFailed,
+            fingerprints_bytes_hashed = :fingerprintsBytesHashed,
+            error_count = :errorCount
+        WHERE id = :sessionId
+        """
+    )
+    suspend fun updateFingerprintCounters(
+        sessionId: String,
+        fingerprintsTotal: Int,
+        fingerprintsComputed: Int,
+        fingerprintsCached: Int,
+        fingerprintsUnsupported: Int,
+        fingerprintsFailed: Int,
+        fingerprintsBytesHashed: Long,
+        errorCount: Int
+    )
+
+    @Query(
+        """
+        UPDATE scan_sessions
+        SET scan_phase = :scanPhase,
+            status = :status,
+            completed_timestamp = :completedTimestamp,
+            error_message = :errorMessage,
+            total_files = :totalFiles,
+            total_directories = :totalDirectories,
+            known_total_bytes = :knownTotalBytes,
+            unknown_size_files = :unknownSizeFiles,
+            excluded_items = :excludedItems,
+            error_count = :errorCount,
+            fingerprints_total = :fingerprintsTotal,
+            fingerprints_computed = :fingerprintsComputed,
+            fingerprints_cached = :fingerprintsCached,
+            fingerprints_unsupported = :fingerprintsUnsupported,
+            fingerprints_failed = :fingerprintsFailed,
+            fingerprints_bytes_hashed = :fingerprintsBytesHashed
+        WHERE id = :sessionId
+        """
+    )
+    suspend fun finalizeSessionState(
+        sessionId: String,
+        scanPhase: String,
+        status: String,
+        completedTimestamp: Long,
+        errorMessage: String?,
+        totalFiles: Int,
+        totalDirectories: Int,
+        knownTotalBytes: Long,
+        unknownSizeFiles: Int,
+        excludedItems: Int,
+        errorCount: Int,
+        fingerprintsTotal: Int,
+        fingerprintsComputed: Int,
+        fingerprintsCached: Int,
+        fingerprintsUnsupported: Int,
+        fingerprintsFailed: Int,
+        fingerprintsBytesHashed: Long
+    )
+
     @Query("SELECT * FROM scan_sessions WHERE id = :id LIMIT 1")
     suspend fun getSessionById(id: String): ScanSessionEntity?
 

@@ -1,7 +1,9 @@
 package com.androidbackup.app.data.repository
 
 import android.net.Uri
+import com.androidbackup.app.data.local.dao.FileFingerprintDao
 import com.androidbackup.app.data.local.dao.FolderDao
+import com.androidbackup.app.data.local.dao.ScanSessionDao
 import com.androidbackup.app.data.local.entity.BackupFolderEntity
 import com.androidbackup.app.data.model.BackupSource
 import com.androidbackup.app.data.model.Priority
@@ -55,6 +57,10 @@ class PermissionCompensationFailedException(
 class FolderRepository(
     private val folderDao: FolderDao,
     private val safPermissionManager: SafPermissionManager,
+    private val scanSessionDao: ScanSessionDao,
+    private val fileFingerprintDao: FileFingerprintDao,
+    private val lifecycleCoordinator: FolderLifecycleCoordinator,
+    private val runInTransaction: suspend (suspend () -> Unit) -> Unit,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
 ) {
 
@@ -217,33 +223,55 @@ class FolderRepository(
     }
 
     /**
-     * Rimuove una cartella dalla configurazione.
+     * Rimuove una cartella dalla configurazione in modo coordinato con l'avvio scansioni.
      *
      * Flusso:
-     * 1. Rimuove il record dal database Room.
-     * 2. Controlla se nessun'altra configurazione utilizza lo stesso URI.
-     * 3. Se nessun'altra cartella lo utilizza, rilascia il permesso persistente SAF.
-     * 4. Se il rilascio fallisce, solleva [PermissionReleaseException] per consentire retry o segnalazione parziale.
-     * 5. Non tocca mai i file locali fisici dell'utente.
+     * 1. Sotto lock condiviso [lifecycleCoordinator], verifica l'assenza di sessioni RUNNING o PAUSED.
+     * 2. In una singola transazione Room ([runInTransaction]), ri-verifica l'assenza di sessioni attive,
+     *    elimina il record dalla tabella `backup_folders` e pulisce la cache `file_fingerprints`.
+     * 3. Solo dopo il commit della transazione rilascia l'eventuale permesso persistente SAF.
+     * 4. Se il rilascio SAF fallisce, solleva [PermissionReleaseException] per consentire retry.
      */
     suspend fun removeFolder(id: String): Result<Unit> = withContext(ioDispatcher) {
         writeMutex.withLock {
             runCatching {
-                val folder = folderDao.getFolderById(id) ?: return@runCatching
+                var uriToRelease: Uri? = null
 
-                // 1. Rimuove prima da Room
-                folderDao.deleteFolderById(id)
+                lifecycleCoordinator.withLock {
+                    val activeSession = scanSessionDao.getRunningOrPausedSession()
+                    if (activeSession != null) {
+                        throw IllegalStateException(
+                            "Impossibile rimuovere la cartella mentre è presente una scansione attiva o in pausa (sessione: ${activeSession.id}, stato: ${activeSession.status})."
+                        )
+                    }
 
-                // 2. Controlla se altre entità utilizzano lo stesso treeUri
-                val remainingWithSameUri = folderDao.getFolderByUri(folder.treeUri)
-                if (remainingWithSameUri == null) {
-                    val uri = Uri.parse(folder.treeUri)
-                    val releaseResult = safPermissionManager.releasePersistableReadPermission(uri)
+                    runInTransaction {
+                        val activeInsideTx = scanSessionDao.getRunningOrPausedSession()
+                        if (activeInsideTx != null) {
+                            throw IllegalStateException(
+                                "Impossibile rimuovere la cartella mentre è presente una scansione attiva o in pausa (sessione: ${activeInsideTx.id}, stato: ${activeInsideTx.status})."
+                            )
+                        }
+
+                        val folder = folderDao.getFolderById(id) ?: return@runInTransaction
+                        folderDao.deleteFolderById(id)
+                        fileFingerprintDao.deleteByFolderId(id)
+
+                        val remainingWithSameUri = folderDao.getFolderByUri(folder.treeUri)
+                        if (remainingWithSameUri == null) {
+                            uriToRelease = Uri.parse(folder.treeUri)
+                        }
+                    }
+                }
+
+                val releaseTarget = uriToRelease
+                if (releaseTarget != null) {
+                    val releaseResult = safPermissionManager.releasePersistableReadPermission(releaseTarget)
                     refreshAccessibility()
                     if (releaseResult.isFailure) {
                         val cause = releaseResult.exceptionOrNull()
                         throw PermissionReleaseException(
-                            treeUri = uri,
+                            treeUri = releaseTarget,
                             message = "Cartella rimossa dalla configurazione, ma il rilascio del permesso SAF di sistema è fallito: ${cause?.localizedMessage}. Il permesso può essere rilasciato tramite retry.",
                             cause = cause
                         )

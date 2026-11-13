@@ -97,6 +97,45 @@ interface ScannedDocumentDao {
     @Query("SELECT COUNT(*) FROM scanned_documents WHERE scan_session_id = :sessionId AND backup_folder_id = :folderId AND is_excluded = 1")
     suspend fun countExcludedForFolder(sessionId: String, folderId: String): Int
 
+    @Query(
+        """
+        SELECT * FROM scanned_documents
+        WHERE scan_session_id = :sessionId
+          AND fingerprint_status = 'PENDING'
+          AND is_directory = 0
+          AND is_excluded = 0
+        ORDER BY relative_path ASC
+        LIMIT :limit
+        """
+    )
+    suspend fun getNextPendingFingerprintBatch(sessionId: String, limit: Int): List<ScannedDocumentEntity>
+
+    @Query(
+        """
+        SELECT COUNT(*) FROM scanned_documents
+        WHERE scan_session_id = :sessionId
+          AND is_directory = 0
+          AND is_excluded = 0
+          AND fingerprint_status = :status
+        """
+    )
+    suspend fun countFingerprintsByStatus(sessionId: String, status: String): Int
+
+    @Query(
+        """
+        SELECT COALESCE(SUM(hashed_bytes_read), 0) FROM scanned_documents
+        WHERE scan_session_id = :sessionId
+          AND is_directory = 0
+          AND is_excluded = 0
+          AND fingerprint_status = 'COMPUTED'
+          AND hashed_bytes_read IS NOT NULL
+        """
+    )
+    suspend fun sumHashedBytesComputedForSession(sessionId: String): Long
+
+    @Query("SELECT DISTINCT backup_folder_id FROM scanned_documents WHERE scan_session_id = :sessionId")
+    suspend fun getDistinctFolderIdsForSession(sessionId: String): List<String>
+
     @Query("DELETE FROM scanned_documents WHERE scan_session_id = :sessionId")
     suspend fun deleteDocumentsBySession(sessionId: String): Int
 

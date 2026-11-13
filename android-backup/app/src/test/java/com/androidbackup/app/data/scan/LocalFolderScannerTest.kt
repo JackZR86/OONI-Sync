@@ -2,19 +2,27 @@ package com.androidbackup.app.data.scan
 
 import android.content.Context
 import android.net.Uri
+import android.provider.DocumentsContract
 import androidx.room.Room
+import androidx.room.withTransaction
 import androidx.test.core.app.ApplicationProvider
 import com.androidbackup.app.data.local.database.BackupDatabase
 import com.androidbackup.app.data.local.entity.BackupFolderEntity
 import com.androidbackup.app.data.local.entity.FingerprintStatus
+import com.androidbackup.app.data.local.entity.ScanPhase
 import com.androidbackup.app.data.local.entity.ScanSessionStatus
 import com.androidbackup.app.data.model.BackupSource
 import com.androidbackup.app.data.model.Priority
+import com.androidbackup.app.data.repository.FolderLifecycleCoordinator
 import com.androidbackup.app.data.repository.FolderRepository
 import com.androidbackup.app.data.repository.ScanRepository
 import com.androidbackup.app.data.repository.SettingsRepository
+import com.androidbackup.app.data.saf.SafDocumentMetadata
+import com.androidbackup.app.testutils.FakeSafContentReader
 import com.androidbackup.app.testutils.FakeSafPermissionManager
 import com.androidbackup.app.testutils.FakeSafTreeReader
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
@@ -29,6 +37,8 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.io.FileNotFoundException
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
  * Suite di test per il motore di scansione locale e inventario Room (Fase 1B.2).
@@ -40,15 +50,59 @@ class LocalFolderScannerTest {
 
     private lateinit var database: BackupDatabase
     private lateinit var fakeSafTreeReader: FakeSafTreeReader
+    private lateinit var fakeSafContentReader: FakeSafContentReader
     private lateinit var fakeSafPermissionManager: FakeSafPermissionManager
+    private lateinit var lifecycleCoordinator: FolderLifecycleCoordinator
     private lateinit var folderRepository: FolderRepository
     private lateinit var settingsRepository: SettingsRepository
     private lateinit var scanner: LocalFolderScanner
+    private lateinit var fingerprinter: LocalFileFingerprinter
     private lateinit var scanRepository: ScanRepository
 
     private val treeUri = Uri.parse("content://com.android.externalstorage.documents/tree/primary%3ATestFolder")
     private val rootDocId = "primary:TestFolder"
     private lateinit var configuredFolder: BackupFolderEntity
+
+    private fun buildDocUri(documentId: String): Uri {
+        return try {
+            DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId)
+        } catch (t: Throwable) {
+            treeUri.buildUpon().appendPath("document").appendPath(documentId).build()
+        }
+    }
+
+    private fun registerReadableFile(
+        parentDocumentId: String,
+        documentId: String,
+        displayName: String,
+        sizeBytes: Long,
+        mimeType: String = "application/octet-stream",
+        lastModified: Long = 1_730_000_000_000L
+    ) {
+        fakeSafTreeReader.addFile(
+            treeUri = treeUri,
+            parentDocumentId = parentDocumentId,
+            documentId = documentId,
+            displayName = displayName,
+            sizeBytes = sizeBytes,
+            mimeType = mimeType,
+            lastModified = lastModified
+        )
+        val payload = ByteArray(sizeBytes.toInt()) { idx -> (idx and 0x7F).toByte() }
+        fakeSafContentReader.putContent(
+            documentUri = buildDocUri(documentId),
+            bytes = payload,
+            metadata = SafDocumentMetadata(
+                documentId = documentId,
+                displayName = displayName,
+                mimeType = mimeType,
+                sizeBytes = sizeBytes,
+                lastModifiedTimestamp = lastModified,
+                flags = 0,
+                isDirectory = false
+            )
+        )
+    }
 
     @Before
     fun setUp() {
@@ -59,9 +113,18 @@ class LocalFolderScannerTest {
                 .build()
 
             fakeSafTreeReader = FakeSafTreeReader()
+            fakeSafContentReader = FakeSafContentReader()
             fakeSafPermissionManager = FakeSafPermissionManager()
+            lifecycleCoordinator = FolderLifecycleCoordinator()
 
-            folderRepository = FolderRepository(database.folderDao(), fakeSafPermissionManager)
+            folderRepository = FolderRepository(
+                folderDao = database.folderDao(),
+                safPermissionManager = fakeSafPermissionManager,
+                scanSessionDao = database.scanSessionDao(),
+                fileFingerprintDao = database.fileFingerprintDao(),
+                lifecycleCoordinator = lifecycleCoordinator,
+                runInTransaction = { block -> database.withTransaction { block() } }
+            )
             settingsRepository = SettingsRepository(database.settingsDao())
             settingsRepository.initializeDefaultsIfEmpty()
 
@@ -74,14 +137,29 @@ class LocalFolderScannerTest {
                 safPermissionManager = fakeSafPermissionManager
             )
 
+            fingerprinter = LocalFileFingerprinter(
+                fileFingerprintDao = database.fileFingerprintDao(),
+                scannedDocumentDao = database.scannedDocumentDao(),
+                scanErrorDao = database.scanErrorDao(),
+                safContentReader = fakeSafContentReader,
+                safPermissionManager = fakeSafPermissionManager,
+                streamHasher = Sha256StreamHasher(),
+                runInTransaction = { block -> database.withTransaction { block() } }
+            )
+
             scanRepository = ScanRepository(
                 scanSessionDao = database.scanSessionDao(),
                 scannedDocumentDao = database.scannedDocumentDao(),
                 pendingDirectoryDao = database.pendingDirectoryDao(),
                 scanErrorDao = database.scanErrorDao(),
+                fileFingerprintDao = database.fileFingerprintDao(),
+                folderDao = database.folderDao(),
                 scanner = scanner,
-                folderRepository = folderRepository,
-                settingsRepository = settingsRepository
+                fingerprinter = fingerprinter,
+                safPermissionManager = fakeSafPermissionManager,
+                settingsRepository = settingsRepository,
+                lifecycleCoordinator = lifecycleCoordinator,
+                runInTransaction = { block -> database.withTransaction { block() } }
             )
 
             // Configura autorizzazione SAF e cartella in Room
@@ -392,19 +470,26 @@ class LocalFolderScannerTest {
 
     @Test
     fun test15_PreserveLastCompletedInventoryWhenNewScanInterrupted() = runBlocking {
-        fakeSafTreeReader.addFile(treeUri, rootDocId, "doc:stable", "stabile.pdf", 4096L)
+        registerReadableFile(rootDocId, "doc:stable", "stabile.pdf", 4096L, mimeType = "application/pdf")
 
-        // Prima scansione completata con successo
+        // Prima scansione completata con successo tramite ScanRepository
         val completedSession = scanRepository.startNewScan().getOrThrow()
-        scanner.runScan(completedSession.id, emptyList())
+        awaitSessionStatus(completedSession.id, ScanSessionStatus.COMPLETED)
+        scanRepository.awaitActiveJobCompletion()
 
         val initialStats = scanRepository.getFolderStats(configuredFolder.id)
         assertEquals(1, initialStats.fileCount)
         assertEquals(4096L, initialStats.totalKnownBytes)
 
-        // Avvio di una nuova scansione che viene interrotta / cancellata
-        val newSession = scanRepository.startNewScan().getOrThrow()
-        scanRepository.cancelScan()
+        // Avvio di una nuova scansione che viene interrotta / cancellata in modo deterministico
+        val enteredSecondScan = CountDownLatch(1)
+        fakeSafContentReader.setBlockingStream(
+            documentUri = buildDocUri("doc:stable"),
+            onBlockedEntered = { enteredSecondScan.countDown() }
+        )
+        scanRepository.startNewScan().getOrThrow()
+        assertTrue(enteredSecondScan.await(5, TimeUnit.SECONDS))
+        scanRepository.cancelScan().getOrThrow()
 
         // Le statistiche e l'inventario dell'ultima sessione completata rimangono intatti e accessibili
         val lastCompleted = database.scanSessionDao().getLatestCompletedSession()
@@ -441,11 +526,25 @@ class LocalFolderScannerTest {
 
     @Test
     fun test19_CancelDoesNotLeakFlagAndNextScanSucceeds() = runBlocking {
-        fakeSafTreeReader.addFile(treeUri, rootDocId, "doc:f1", "file1.txt", 100L)
+        fakeSafTreeReader.addFile(treeUri, rootDocId, "doc:f1", "file1.txt", 100L, mimeType = "text/plain")
+        val f1Uri = buildDocUri("doc:f1")
+        val f1Meta = SafDocumentMetadata(
+            documentId = "doc:f1",
+            displayName = "file1.txt",
+            mimeType = "text/plain",
+            sizeBytes = 100L,
+            lastModifiedTimestamp = 1_730_000_000_000L,
+            flags = 0,
+            isDirectory = false
+        )
+        val blockedEntered = CountDownLatch(1)
+        fakeSafContentReader.putMetadata(f1Uri, f1Meta)
+        fakeSafContentReader.setBlockingStream(f1Uri, onBlockedEntered = { blockedEntered.countDown() })
 
         // 1. Avvia la prima sessione esclusivamente tramite ScanRepository (senza chiamare scanner.runScan)
         val session1 = scanRepository.startNewScan().getOrThrow()
-        
+        assertTrue(blockedEntered.await(5, TimeUnit.SECONDS))
+
         // 2. Annulla la sessione tramite ScanRepository
         scanRepository.cancelScan().getOrThrow()
 
@@ -455,7 +554,8 @@ class LocalFolderScannerTest {
         val pendingS1 = database.pendingDirectoryDao().getPendingDirectories(session1.id)
         assertTrue("La coda pendente della sessione annullata deve essere vuota", pendingS1.isEmpty())
 
-        // 3. Avvia una seconda sessione esclusivamente tramite ScanRepository
+        // 3. Ripristina il contenuto leggibile e avvia una seconda sessione esclusivamente tramite ScanRepository
+        fakeSafContentReader.putContent(f1Uri, ByteArray(100) { idx -> (idx and 0x7F).toByte() }, f1Meta)
         val session2 = scanRepository.startNewScan().getOrThrow()
 
         // 4. Attende il completamento naturale del job orchestrato da ScanRepository
@@ -467,16 +567,31 @@ class LocalFolderScannerTest {
 
     @Test
     fun test20_SequencePauseCancelAndNewScan() = runBlocking {
-        fakeSafTreeReader.addFile(treeUri, rootDocId, "doc:f1", "file1.txt", 100L)
+        fakeSafTreeReader.addFile(treeUri, rootDocId, "doc:f1", "file1.txt", 100L, mimeType = "text/plain")
+        val f1Uri = buildDocUri("doc:f1")
+        val f1Meta = SafDocumentMetadata(
+            documentId = "doc:f1",
+            displayName = "file1.txt",
+            mimeType = "text/plain",
+            sizeBytes = 100L,
+            lastModifiedTimestamp = 1_730_000_000_000L,
+            flags = 0,
+            isDirectory = false
+        )
+        val blockedEntered = CountDownLatch(1)
+        fakeSafContentReader.putMetadata(f1Uri, f1Meta)
+        fakeSafContentReader.setBlockingStream(f1Uri, onBlockedEntered = { blockedEntered.countDown() })
 
-        // 1. Avvia la prima sessione tramite repository
-        val session1 = scanRepository.startNewScan().getOrThrow()
+        // 1. Avvia la prima sessione tramite repository e attendi l'ingresso nella lettura
+        scanRepository.startNewScan().getOrThrow()
+        assertTrue(blockedEntered.await(5, TimeUnit.SECONDS))
 
         // 2. Mette in pausa e poi annulla tramite repository
         scanRepository.pauseScan().getOrThrow()
         scanRepository.cancelScan().getOrThrow()
 
-        // 3. Nuova scansione deve avviarsi pulita e completarsi tramite il background job del repository
+        // 3. Ripristina il contenuto: la nuova scansione deve avviarsi pulita e completarsi
+        fakeSafContentReader.putContent(f1Uri, ByteArray(100) { idx -> (idx and 0x7F).toByte() }, f1Meta)
         val session2 = scanRepository.startNewScan().getOrThrow()
         val s2Completed = awaitSessionStatus(session2.id, ScanSessionStatus.COMPLETED)
         assertEquals(ScanSessionStatus.COMPLETED.name, s2Completed.status)
@@ -658,12 +773,12 @@ class LocalFolderScannerTest {
     fun test27_ProcessDeathRecoveryAcrossInstances() = runBlocking {
         // 1. Simula scansione in corso prima del crash: sessione creata e coda non vuota
         val session = scanner.createNewSession(folderRepository.getFolders())
-        fakeSafTreeReader.addFile(treeUri, rootDocId, "doc:after_crash", "recovered.txt", 400L)
+        registerReadableFile(rootDocId, "doc:after_crash", "recovered.txt", 400L, mimeType = "text/plain")
 
         // 2. Simula terminazione anomala del processo (nessun finally eseguito): lo stato nel DB resta RUNNING
         database.scanSessionDao().updateStatus(session.id, ScanSessionStatus.RUNNING.name)
 
-        // 3. Nuova istanza di Scanner e Repository avviata dal nuovo processo dell'app
+        // 3. Nuova istanza di Scanner, Fingerprinter e Repository avviata dal nuovo processo dell'app
         val newScanner = LocalFolderScanner(
             scanSessionDao = database.scanSessionDao(),
             scannedDocumentDao = database.scannedDocumentDao(),
@@ -672,14 +787,28 @@ class LocalFolderScannerTest {
             safTreeReader = fakeSafTreeReader,
             safPermissionManager = fakeSafPermissionManager
         )
+        val newFingerprinter = LocalFileFingerprinter(
+            fileFingerprintDao = database.fileFingerprintDao(),
+            scannedDocumentDao = database.scannedDocumentDao(),
+            scanErrorDao = database.scanErrorDao(),
+            safContentReader = fakeSafContentReader,
+            safPermissionManager = fakeSafPermissionManager,
+            streamHasher = Sha256StreamHasher(),
+            runInTransaction = { block -> database.withTransaction { block() } }
+        )
         val newScanRepo = ScanRepository(
             scanSessionDao = database.scanSessionDao(),
             scannedDocumentDao = database.scannedDocumentDao(),
             pendingDirectoryDao = database.pendingDirectoryDao(),
             scanErrorDao = database.scanErrorDao(),
+            fileFingerprintDao = database.fileFingerprintDao(),
+            folderDao = database.folderDao(),
             scanner = newScanner,
-            folderRepository = folderRepository,
-            settingsRepository = settingsRepository
+            fingerprinter = newFingerprinter,
+            safPermissionManager = fakeSafPermissionManager,
+            settingsRepository = settingsRepository,
+            lifecycleCoordinator = FolderLifecycleCoordinator(),
+            runInTransaction = { block -> database.withTransaction { block() } }
         )
 
         // All'avvio dell'app il nuovo repository rileva la sessione interrotta
@@ -812,7 +941,7 @@ class LocalFolderScannerTest {
         // A. Errore Room e retry attraverso il repository
         // 1. Crea una struttura SAF con una directory figlia e almeno un file al suo interno
         fakeSafTreeReader.addDirectory(treeUri, rootDocId, "doc:sub_repo", "SubRepo")
-        fakeSafTreeReader.addFile(treeUri, "doc:sub_repo", "doc:file_repo", "file_repo.txt", 350L)
+        registerReadableFile("doc:sub_repo", "doc:file_repo", "file_repo.txt", 350L, mimeType = "text/plain")
 
         // 2. Simula un errore SQLite durante l'inserimento atomico del batch figlio (non durante la creazione sessione radice)
         database.openHelper.writableDatabase.execSQL(
@@ -871,12 +1000,29 @@ class LocalFolderScannerTest {
 
     @Test
     fun test31_StartNewScanRejectedWhenSessionIsPaused() = runBlocking {
-        // B. Nuova scansione con sessione in pausa
-        fakeSafTreeReader.addFile(treeUri, rootDocId, "doc:f_p1", "paused1.txt", 100L)
+        // B. Nuova scansione con sessione in pausa deterministica durante la Discovery
+        fakeSafTreeReader.addDirectory(treeUri, rootDocId, "doc:d_p1", "dir1")
+        registerReadableFile("doc:d_p1", "doc:f_p1", "paused1.txt", 100L, mimeType = "text/plain")
+        fakeSafTreeReader.addDirectory(treeUri, rootDocId, "doc:d_p2", "dir2")
+        registerReadableFile("doc:d_p2", "doc:f_p2", "paused2.txt", 200L, mimeType = "text/plain")
 
-        // 1. Crea una sessione e portala a PAUSED
+        val enteredD1 = CountDownLatch(1)
+        val allowD1Proceed = CountDownLatch(1)
+        fakeSafTreeReader.onDirectoryQueried = { docId ->
+            if (docId == "doc:d_p1") {
+                enteredD1.countDown()
+                allowD1Proceed.await(5, TimeUnit.SECONDS)
+            }
+        }
+
+        // 1. Crea una sessione e metti in pausa in modo deterministico lasciando doc:d_p2 in coda
         val s1 = scanRepository.startNewScan().getOrThrow()
-        scanRepository.pauseScan().getOrThrow()
+        assertTrue(enteredD1.await(5, TimeUnit.SECONDS))
+        val pauseDeferred = async(Dispatchers.Default) { scanRepository.pauseScan() }
+        Thread.sleep(100L)
+        allowD1Proceed.countDown()
+        pauseDeferred.await().getOrThrow()
+        fakeSafTreeReader.onDirectoryQueried = null
 
         val pausedSession = database.scanSessionDao().getSessionById(s1.id)!!
         assertEquals(ScanSessionStatus.PAUSED.name, pausedSession.status)
@@ -986,5 +1132,21 @@ class LocalFolderScannerTest {
         assertEquals(FingerprintStatus.NOT_REQUIRED.name, excludedFile.fingerprintStatus)
         assertEquals(FingerprintStatus.NOT_REQUIRED.name, excludedDir.fingerprintStatus)
         assertEquals(FingerprintStatus.PENDING.name, includedFile.fingerprintStatus)
+    }
+
+    @Test
+    fun test34_RunDiscoverySeparatesDiscoveryFromFinalization() = runBlocking {
+        fakeSafTreeReader.addFile(treeUri, rootDocId, "doc:f_disc", "disc.txt", 256L)
+
+        val session = scanner.createNewSession(folderRepository.getFolders())
+        val outcome = scanner.runDiscovery(session.id, emptyList())
+
+        assertEquals(DiscoveryOutcome.Completed, outcome)
+
+        val dbSession = database.scanSessionDao().getSessionById(session.id)!!
+        assertEquals(ScanSessionStatus.RUNNING.name, dbSession.status)
+        assertEquals(ScanPhase.DISCOVERY.name, dbSession.scanPhase)
+        assertNull(dbSession.completedTimestamp)
+        assertEquals(1, dbSession.totalFiles)
     }
 }

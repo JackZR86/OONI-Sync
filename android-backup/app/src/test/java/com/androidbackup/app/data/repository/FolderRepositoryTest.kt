@@ -4,10 +4,14 @@ import android.content.Context
 import android.database.sqlite.SQLiteConstraintException
 import android.net.Uri
 import androidx.room.Room
+import androidx.room.withTransaction
 import androidx.test.core.app.ApplicationProvider
 import com.androidbackup.app.data.local.dao.FolderDao
 import com.androidbackup.app.data.local.database.BackupDatabase
 import com.androidbackup.app.data.local.entity.BackupFolderEntity
+import com.androidbackup.app.data.local.entity.FileFingerprintEntity
+import com.androidbackup.app.data.local.entity.ScanSessionEntity
+import com.androidbackup.app.data.local.entity.ScanSessionStatus
 import com.androidbackup.app.data.model.Priority
 import com.androidbackup.app.testutils.FakeSafPermissionManager
 import kotlinx.coroutines.flow.Flow
@@ -84,7 +88,14 @@ class FolderRepositoryTest {
             .build()
         delegatingFolderDao = DelegatingFolderDao(database.folderDao())
         fakeSafPermissionManager = FakeSafPermissionManager()
-        repository = FolderRepository(delegatingFolderDao, fakeSafPermissionManager)
+        repository = FolderRepository(
+            folderDao = delegatingFolderDao,
+            safPermissionManager = fakeSafPermissionManager,
+            scanSessionDao = database.scanSessionDao(),
+            fileFingerprintDao = database.fileFingerprintDao(),
+            lifecycleCoordinator = FolderLifecycleCoordinator(),
+            runInTransaction = { block -> database.withTransaction { block() } }
+        )
     }
 
     @After
@@ -408,5 +419,104 @@ class FolderRepositoryTest {
         updated = repository.getFolders().first { it.id == folder.id }
         assertEquals(Priority.ALTA, updated.priority)
         assertTrue(updated.protectFromEviction)
+    }
+
+    @Test
+    fun testRemoveFolderAtomicallyDeletesFingerprintCache() = runBlocking {
+        val uri = Uri.parse("content://com.android.externalstorage.documents/tree/primary%3APictures")
+        val folder = repository.addFolder(uri, Priority.ALTA, false).getOrThrow()
+
+        database.fileFingerprintDao().upsertFingerprint(
+            FileFingerprintEntity(
+                id = "fp-1",
+                backupFolderId = folder.id,
+                documentId = "doc:img1",
+                documentUri = "$uri/document/doc%3Aimg1",
+                relativePath = "img1.jpg",
+                mimeType = "image/jpeg",
+                sizeBytes = 1024L,
+                lastModifiedTimestamp = 10_000L,
+                computedBytes = 1024L,
+                sha256Hex = "a".repeat(64),
+                lastContentHashedTimestamp = 20_000L,
+                lastMetadataMatchedTimestamp = 20_000L,
+                lastSeenSessionId = "sess-prev"
+            )
+        )
+        assertEquals(1, database.fileFingerprintDao().countByFolder(folder.id))
+
+        val removeResult = repository.removeFolder(folder.id)
+        assertTrue(removeResult.isSuccess)
+        assertTrue(repository.getFolders().isEmpty())
+        assertEquals(0, database.fileFingerprintDao().countByFolder(folder.id))
+        assertFalse(fakeSafPermissionManager.hasPersistedReadPermission(uri))
+    }
+
+    @Test
+    fun testRemoveFolderRejectedWhileScanRunningOrPaused() = runBlocking {
+        val uri = Uri.parse("content://com.android.externalstorage.documents/tree/primary%3ADCIM")
+        val folder = repository.addFolder(uri, Priority.ALTA, false).getOrThrow()
+
+        database.scanSessionDao().insertSession(
+            ScanSessionEntity(
+                id = "sess-active",
+                status = ScanSessionStatus.RUNNING.name
+            )
+        )
+
+        val rejectRunning = repository.removeFolder(folder.id)
+        assertTrue("La rimozione deve essere rifiutata con sessione RUNNING", rejectRunning.isFailure)
+        assertEquals(1, repository.getFolders().size)
+        assertTrue(fakeSafPermissionManager.hasPersistedReadPermission(uri))
+
+        database.scanSessionDao().updateStatus("sess-active", ScanSessionStatus.PAUSED.name)
+        val rejectPaused = repository.removeFolder(folder.id)
+        assertTrue("La rimozione deve essere rifiutata con sessione PAUSED", rejectPaused.isFailure)
+        assertEquals(1, repository.getFolders().size)
+        assertTrue(fakeSafPermissionManager.hasPersistedReadPermission(uri))
+    }
+
+    @Test
+    fun testRemoveFolderRollsBackTransactionIfCacheDeleteFails() = runBlocking {
+        val uri = Uri.parse("content://com.android.externalstorage.documents/tree/primary%3ADownload")
+        val folder = repository.addFolder(uri, Priority.NORMALE, false).getOrThrow()
+
+        database.fileFingerprintDao().upsertFingerprint(
+            FileFingerprintEntity(
+                id = "fp-rollback",
+                backupFolderId = folder.id,
+                documentId = "doc:rb",
+                documentUri = "$uri/document/doc%3Arb",
+                relativePath = "rb.bin",
+                mimeType = "application/octet-stream",
+                sizeBytes = 64L,
+                lastModifiedTimestamp = 10_000L,
+                computedBytes = 64L,
+                sha256Hex = "b".repeat(64),
+                lastContentHashedTimestamp = 20_000L,
+                lastMetadataMatchedTimestamp = 20_000L,
+                lastSeenSessionId = "sess-prev"
+            )
+        )
+
+        database.openHelper.writableDatabase.execSQL(
+            """
+            CREATE TRIGGER trigger_fail_fp_delete
+            BEFORE DELETE ON file_fingerprints
+            BEGIN
+                SELECT RAISE(ABORT, 'Errore simulato eliminazione cache fingerprint');
+            END;
+            """.trimIndent()
+        )
+
+        val result = repository.removeFolder(folder.id)
+        assertTrue("La rimozione deve fallire per rollback transazionale", result.isFailure)
+
+        // Rollback integrale: cartella ancora presente, cache intatta, permesso SAF non rilasciato
+        assertEquals(1, database.folderDao().getFolders().size)
+        assertEquals(1, database.fileFingerprintDao().countByFolder(folder.id))
+        assertTrue(fakeSafPermissionManager.hasPersistedReadPermission(uri))
+
+        database.openHelper.writableDatabase.execSQL("DROP TRIGGER IF EXISTS trigger_fail_fp_delete;")
     }
 }

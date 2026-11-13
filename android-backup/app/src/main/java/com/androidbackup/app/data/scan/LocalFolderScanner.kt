@@ -13,25 +13,35 @@ import com.androidbackup.app.data.saf.NullCursorException
 import com.androidbackup.app.data.saf.SafDocumentMetadata
 import com.androidbackup.app.data.saf.SafPermissionManager
 import com.androidbackup.app.data.saf.SafTreeReader
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.isActive
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.util.UUID
 
 /**
- * Motore di scansione ricorsiva locale delle cartelle SAF (Fase 1B.2 - Revisione).
+ * Esito tipizzato della sola fase di Discovery ([LocalFolderScanner.runDiscovery]).
+ */
+sealed class DiscoveryOutcome {
+    object Completed : DiscoveryOutcome()
+    object Paused : DiscoveryOutcome()
+    object Cancelled : DiscoveryOutcome()
+}
+
+/**
+ * Motore di scansione ricorsiva locale delle cartelle SAF (Fase 1B.2 - 1B.3C).
  *
- * Conforme alla Specifica Fase 1B.2 e Revisione Correttiva:
+ * Conforme alla Specifica Fase 1B.2, 1B.3B e 1B.3C:
  * - Esplorazione ricorsiva ad albero una directory alla volta tramite la coda persistente [PendingDirectoryEntity].
  * - Elaborazione progressiva in streaming a piccoli batch (50-100 elementi) per non accumulare dati in memoria.
  * - Idempotente e resiliente a interruzioni di processo.
  * - Distinzione netta tra directory vuota (0 elementi) e Cursor nullo (errore del provider).
  * - Prevenzione cicli e directory già visitate basata sull'identità persistita in [ScannedDocumentEntity].
- * - Inizializzazione sessione atomica e transazionale.
+ * - Inizializzazione sessione atomica e transazionale con configurazione di [FingerprintMode] e TTL.
  * - Supporto a Pausa, Ripresa e Annullamento cooperativo senza leakage di flag tra sessioni.
- * - Conservazione delle ultime due sessioni completate durante la pulizia.
- * - Nessun accesso ai contenuti o calcolo di hash (esclusivamente metadati).
+ * - Separazione esplicita della sola fase Discovery ([runDiscovery]) dalla finalizzazione completa gestita da [ScanRepository].
  */
 class LocalFolderScanner(
     private val scanSessionDao: ScanSessionDao,
@@ -71,7 +81,9 @@ class LocalFolderScanner(
      * e registra le directory radice in [scanned_documents] per abilitare la prevenzione dei cicli.
      */
     suspend fun createNewSession(
-        folders: List<BackupSource>
+        folders: List<BackupSource>,
+        fingerprintMode: FingerprintMode = FingerprintMode.INCREMENTAL,
+        fingerprintMaxCacheAgeMs: Long? = null
     ): ScanSessionEntity = withContext(ioDispatcher) {
         resetControlFlags()
 
@@ -79,7 +91,10 @@ class LocalFolderScanner(
         val session = ScanSessionEntity(
             id = sessionId,
             startedTimestamp = System.currentTimeMillis(),
-            status = ScanSessionStatus.RUNNING.name
+            status = ScanSessionStatus.RUNNING.name,
+            scanPhase = ScanPhase.DISCOVERY.name,
+            fingerprintMode = fingerprintMode.name,
+            fingerprintMaxCacheAgeMs = fingerprintMaxCacheAgeMs
         )
 
         val rootPending = mutableListOf<PendingDirectoryEntity>()
@@ -126,62 +141,97 @@ class LocalFolderScanner(
     }
 
     /**
-     * Esegue o riprende il ciclo di scansione per la sessione specificata.
+     * Esegue o riprende esclusivamente la fase di Discovery per la sessione specificata.
+     * NON finalizza la sessione, NON imposta `scan_phase = COMPLETED` e NON esegue la pulizia
+     * delle sessioni precedenti: tali operazioni appartengono esclusivamente a [ScanRepository].
+     */
+    suspend fun runDiscovery(
+        sessionId: String,
+        exclusionPatterns: List<String>
+    ): DiscoveryOutcome = withContext(ioDispatcher) {
+        try {
+            executeRoomOperation("ripristino stato RUNNING in Discovery") {
+                scanSessionDao.updateStatus(sessionId, ScanSessionStatus.RUNNING.name)
+            }
+
+            while (true) {
+                currentCoroutineContext().ensureActive()
+
+                if (cancelRequested) {
+                    return@withContext DiscoveryOutcome.Cancelled
+                }
+
+                if (pauseRequested) {
+                    return@withContext DiscoveryOutcome.Paused
+                }
+
+                // Preleva la prossima directory pendente dalla coda persistente
+                val pending = executeRoomOperation("lettura prossima directory pendente") {
+                    pendingDirectoryDao.getNextPendingDirectory(sessionId)
+                } ?: return@withContext DiscoveryOutcome.Completed
+
+                val fullyProcessed = processDirectory(sessionId, pending, exclusionPatterns)
+
+                // Aggiorna le statistiche aggregate correnti
+                executeRoomOperation("aggiornamento statistiche Discovery") {
+                    updateSessionStatistics(sessionId)
+                }
+
+                if (!fullyProcessed) {
+                    if (cancelRequested) {
+                        return@withContext DiscoveryOutcome.Cancelled
+                    }
+                    if (pauseRequested) {
+                        return@withContext DiscoveryOutcome.Paused
+                    }
+                }
+            }
+
+            DiscoveryOutcome.Completed
+        } finally {
+            resetControlFlags()
+        }
+    }
+
+    /**
+     * Mantenuto per retrocompatibilità dei test unitari isolati della Fase 1B.2 su [LocalFolderScanner]:
+     * delega a [runDiscovery] e applica la finalizzazione legacy della sola Discovery.
      */
     suspend fun runScan(
         sessionId: String,
         exclusionPatterns: List<String>
     ): ScanSessionStatus = withContext(ioDispatcher) {
-        try {
-            scanSessionDao.updateStatus(sessionId, ScanSessionStatus.RUNNING.name)
-
-            while (coroutineContext.isActive) {
-                if (cancelRequested) {
-                    resetControlFlags()
-                    scanSessionDao.updateStatus(sessionId, ScanSessionStatus.CANCELLED.name)
-                    pendingDirectoryDao.clearPendingForSession(sessionId)
-                    return@withContext ScanSessionStatus.CANCELLED
-                }
-
-                if (pauseRequested) {
-                    resetControlFlags()
-                    scanSessionDao.updateStatus(sessionId, ScanSessionStatus.PAUSED.name)
-                    return@withContext ScanSessionStatus.PAUSED
-                }
-
-                // Preleva la prossima directory pendente dalla coda persistente
-                val pending = pendingDirectoryDao.getNextPendingDirectory(sessionId)
-                if (pending == null) {
-                    // Nessuna directory rimasta: scansione terminata!
-                    return@withContext finalizeSession(sessionId)
-                }
-
-                val fullyProcessed = processDirectory(sessionId, pending, exclusionPatterns)
-
-                // Aggiorna le statistiche aggregate correnti
-                updateSessionStatistics(sessionId)
-
-                if (!fullyProcessed) {
-                    // Interrotto durante lo streaming (pausa o annullamento)
-                    if (cancelRequested) {
-                        resetControlFlags()
-                        scanSessionDao.updateStatus(sessionId, ScanSessionStatus.CANCELLED.name)
-                        pendingDirectoryDao.clearPendingForSession(sessionId)
-                        return@withContext ScanSessionStatus.CANCELLED
-                    }
-                    if (pauseRequested) {
-                        resetControlFlags()
-                        scanSessionDao.updateStatus(sessionId, ScanSessionStatus.PAUSED.name)
-                        return@withContext ScanSessionStatus.PAUSED
-                    }
-                }
+        when (runDiscovery(sessionId, exclusionPatterns)) {
+            DiscoveryOutcome.Cancelled -> {
+                scanSessionDao.updateStatus(sessionId, ScanSessionStatus.CANCELLED.name)
+                pendingDirectoryDao.clearPendingForSession(sessionId)
+                ScanSessionStatus.CANCELLED
             }
+            DiscoveryOutcome.Paused -> {
+                scanSessionDao.updateStatus(sessionId, ScanSessionStatus.PAUSED.name)
+                ScanSessionStatus.PAUSED
+            }
+            DiscoveryOutcome.Completed -> {
+                finalizeSession(sessionId)
+            }
+        }
+    }
 
-            // Se la coroutine è stata cancellata dall'esterno
-            val currentStatus = scanSessionDao.getSessionById(sessionId)?.sessionStatus
-            currentStatus ?: ScanSessionStatus.FAILED
-        } finally {
-            resetControlFlags()
+    private suspend fun <T> executeRoomOperation(
+        operationName: String,
+        block: suspend () -> T
+    ): T {
+        return try {
+            block()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: ScanPersistenceException) {
+            throw e
+        } catch (e: Exception) {
+            throw ScanPersistenceException(
+                "Errore Room durante $operationName: ${e.localizedMessage ?: e.javaClass.simpleName}",
+                e
+            )
         }
     }
 
