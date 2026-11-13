@@ -66,12 +66,36 @@ interface FileFingerprintDao {
 
     /**
      * Rimuove i record obsoleti di una cartella non più presenti tra i file inclusi dell'inventario
-     * della sessione completata senza errori di Discovery.
+     * della sessione indicata.
+     *
+     * Protezione atomica lato database: la cancellazione avviene esclusivamente se:
+     * - la sessione [sessionId] esiste;
+     * - `scan_phase = 'COMPLETED'`;
+     * - `status IN ('COMPLETED', 'COMPLETED_WITH_ERRORS')`;
+     * - non esistono errori in `scan_errors` con `error_phase = 'DISCOVERY'` e `severity = 'ERROR'`
+     *   per la coppia ([sessionId], [folderId]).
+     *
+     * Errori in fase `FINGERPRINTING`, segnalazioni `UNSUPPORTED`/`WARNING` o errori Discovery su altre
+     * cartelle non bloccano la pulizia della cartella verificata. In assenza di tali condizioni
+     * restituisce `0` senza eliminare alcun record.
      */
     @Query(
         """
         DELETE FROM file_fingerprints
         WHERE backup_folder_id = :folderId
+          AND EXISTS (
+              SELECT 1 FROM scan_sessions
+              WHERE id = :sessionId
+                AND scan_phase = 'COMPLETED'
+                AND status IN ('COMPLETED', 'COMPLETED_WITH_ERRORS')
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM scan_errors
+              WHERE scan_session_id = :sessionId
+                AND backup_folder_id = :folderId
+                AND error_phase = 'DISCOVERY'
+                AND severity = 'ERROR'
+          )
           AND document_id NOT IN (
               SELECT document_id FROM scanned_documents
               WHERE scan_session_id = :sessionId

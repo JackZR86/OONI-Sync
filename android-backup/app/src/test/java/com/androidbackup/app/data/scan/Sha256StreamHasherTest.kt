@@ -7,6 +7,7 @@ import com.androidbackup.app.data.saf.SafDocumentMetadata
 import com.androidbackup.app.testutils.FakeSafContentReader
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -340,6 +341,7 @@ class Sha256StreamHasherTest {
         val uri = Uri.parse("content://test.provider/document/blocked_cancel")
         val blockedEntered = CountDownLatch(1)
         val cancelFlag = AtomicBoolean(false)
+        val observedCancelInHasher = AtomicBoolean(false)
 
         contentReader.setBlockingStream(
             documentUri = uri,
@@ -349,32 +351,68 @@ class Sha256StreamHasherTest {
 
         val stream = contentReader.openInputStream(uri)!!
         val deferred = async(Dispatchers.IO) {
-            hasher.computeSha256(
-                inputStream = stream,
-                isCancelRequested = { cancelFlag.get() }
-            )
-        }
-
-        assertTrue(
-            "La lettura avrebbe dovuto raggiungere il punto di blocco",
-            blockedEntered.await(3, TimeUnit.SECONDS)
-        )
-
-        cancelFlag.set(true)
-        hasher.abortActiveStream()
-
-        var caughtCancel = false
-        try {
-            withTimeout(3_000L) {
-                deferred.await()
+            try {
+                hasher.computeSha256(
+                    inputStream = stream,
+                    isCancelRequested = {
+                        val requested = cancelFlag.get()
+                        if (requested) {
+                            observedCancelInHasher.set(true)
+                        }
+                        requested
+                    }
+                )
+                Result.success(Unit)
+            } catch (t: Throwable) {
+                Result.failure<Unit>(t)
             }
-            fail("Doveva terminare con CancellationException dopo abortActiveStream")
-        } catch (_: CancellationException) {
-            caughtCancel = true
         }
 
-        assertTrue(caughtCancel)
-        assertTrue(contentReader.allOpenedStreamsClosed)
+        try {
+            assertTrue(
+                "La lettura avrebbe dovuto raggiungere il punto di blocco",
+                blockedEntered.await(3, TimeUnit.SECONDS)
+            )
+
+            assertFalse("La richiesta di annullamento deve essere false prima del trigger", cancelFlag.get())
+            cancelFlag.set(true)
+            assertTrue(
+                "La richiesta di annullamento deve risultare attiva prima di abortActiveStream()",
+                cancelFlag.get()
+            )
+            hasher.abortActiveStream()
+
+            val outcome = try {
+                withTimeout(3_000L) {
+                    deferred.await()
+                }
+            } catch (e: TimeoutCancellationException) {
+                fail("Timeout: lo stream bloccato non è stato sbloccato dopo abortActiveStream(): ${e.message}")
+                return@runBlocking
+            }
+
+            val failure = outcome.exceptionOrNull()
+            assertNotNull("computeSha256 avrebbe dovuto terminare con CancellationException", failure)
+            assertFalse(
+                "TimeoutCancellationException non deve essere scambiata per annullamento dell'hashing",
+                failure is TimeoutCancellationException
+            )
+            assertTrue(
+                "Attesa CancellationException reale generata dall'hashing, trovata: $failure",
+                failure is CancellationException
+            )
+            assertTrue(
+                "Sha256StreamHasher deve aver rilevato isCancelRequested() == true",
+                observedCancelInHasher.get()
+            )
+            assertEquals(1, contentReader.openStreamCount)
+            assertEquals(1, contentReader.closedStreamCount)
+            assertTrue("Lo stream aperto deve risultare chiuso dopo l'annullamento", contentReader.allOpenedStreamsClosed)
+        } finally {
+            if (deferred.isActive) {
+                deferred.cancel()
+            }
+        }
     }
 
     @Test
@@ -382,6 +420,7 @@ class Sha256StreamHasherTest {
         val uri = Uri.parse("content://test.provider/document/blocked_pause")
         val blockedEntered = CountDownLatch(1)
         val pauseFlag = AtomicBoolean(false)
+        val observedPauseInHasher = AtomicBoolean(false)
 
         contentReader.setBlockingStream(
             documentUri = uri,
@@ -391,32 +430,68 @@ class Sha256StreamHasherTest {
 
         val stream = contentReader.openInputStream(uri)!!
         val deferred = async(Dispatchers.IO) {
-            hasher.computeSha256(
-                inputStream = stream,
-                isPauseRequested = { pauseFlag.get() }
-            )
-        }
-
-        assertTrue(
-            "La lettura avrebbe dovuto raggiungere il punto di blocco",
-            blockedEntered.await(3, TimeUnit.SECONDS)
-        )
-
-        pauseFlag.set(true)
-        hasher.abortActiveStream()
-
-        var caughtPause = false
-        try {
-            withTimeout(3_000L) {
-                deferred.await()
+            try {
+                hasher.computeSha256(
+                    inputStream = stream,
+                    isPauseRequested = {
+                        val requested = pauseFlag.get()
+                        if (requested) {
+                            observedPauseInHasher.set(true)
+                        }
+                        requested
+                    }
+                )
+                Result.success(Unit)
+            } catch (t: Throwable) {
+                Result.failure<Unit>(t)
             }
-            fail("Doveva terminare con HashingPausedException dopo abortActiveStream in pausa")
-        } catch (_: HashingPausedException) {
-            caughtPause = true
         }
 
-        assertTrue(caughtPause)
-        assertTrue(contentReader.allOpenedStreamsClosed)
+        try {
+            assertTrue(
+                "La lettura avrebbe dovuto raggiungere il punto di blocco",
+                blockedEntered.await(3, TimeUnit.SECONDS)
+            )
+
+            assertFalse("La richiesta di pausa deve essere false prima del trigger", pauseFlag.get())
+            pauseFlag.set(true)
+            assertTrue(
+                "La richiesta di pausa deve risultare attiva prima di abortActiveStream()",
+                pauseFlag.get()
+            )
+            hasher.abortActiveStream()
+
+            val outcome = try {
+                withTimeout(3_000L) {
+                    deferred.await()
+                }
+            } catch (e: TimeoutCancellationException) {
+                fail("Timeout: lo stream bloccato non è stato sbloccato dopo abortActiveStream() in pausa: ${e.message}")
+                return@runBlocking
+            }
+
+            val failure = outcome.exceptionOrNull()
+            assertNotNull("computeSha256 avrebbe dovuto terminare con HashingPausedException", failure)
+            assertFalse(
+                "In pausa non deve verificarsi CancellationException né TimeoutCancellationException",
+                failure is CancellationException
+            )
+            assertTrue(
+                "Attesa HashingPausedException dopo sblocco in pausa, trovata: $failure",
+                failure is HashingPausedException
+            )
+            assertTrue(
+                "Sha256StreamHasher deve aver rilevato isPauseRequested() == true",
+                observedPauseInHasher.get()
+            )
+            assertEquals(1, contentReader.openStreamCount)
+            assertEquals(1, contentReader.closedStreamCount)
+            assertTrue("Lo stream aperto deve risultare chiuso dopo la pausa", contentReader.allOpenedStreamsClosed)
+        } finally {
+            if (deferred.isActive) {
+                deferred.cancel()
+            }
+        }
     }
 
     private fun referenceSha256Hex(bytes: ByteArray): String {

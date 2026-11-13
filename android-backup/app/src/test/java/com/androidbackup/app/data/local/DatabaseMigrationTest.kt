@@ -700,10 +700,30 @@ class DatabaseMigrationTest {
         assertEquals(9000L, updatedFp.lastMetadataMatchedTimestamp)
         assertEquals("sess-room-2", updatedFp.lastSeenSessionId)
 
-        // deleteStaleForFolderNotInSession rimuove solo deleted-doc-99 e mantiene raw-doc-1 presente in sess-room-1
-        val deletedStale = roomDb.fileFingerprintDao().deleteStaleForFolderNotInSession("room-migrated-1", "sess-room-1")
+        // deleteStaleForFolderNotInSession su sess-room-1 (scanPhase=DISCOVERY ed errore DISCOVERY) NON deve cancellare nulla
+        val blockedDelete = roomDb.fileFingerprintDao().deleteStaleForFolderNotInSession("room-migrated-1", "sess-room-1")
+        assertEquals(0, blockedDelete)
+        assertEquals(2, roomDb.fileFingerprintDao().countByFolder("room-migrated-1"))
+
+        // Su una sessione completata senza errori Discovery per la cartella, rimuove solo deleted-doc-99 e mantiene raw-doc-1
+        val cleanCompletedSession = ScanSessionEntity(
+            id = "sess-room-clean",
+            startedTimestamp = 6000L,
+            completedTimestamp = 7000L,
+            status = ScanSessionStatus.COMPLETED.name,
+            scanPhase = ScanPhase.COMPLETED.name,
+            totalFiles = 1
+        )
+        roomDb.scanSessionDao().insertSession(cleanCompletedSession)
+        roomDb.scannedDocumentDao().insertDocument(
+            doc1.copy(id = "doc-room-clean-1", scanSessionId = "sess-room-clean")
+        )
+
+        val deletedStale = roomDb.fileFingerprintDao().deleteStaleForFolderNotInSession("room-migrated-1", "sess-room-clean")
         assertEquals(1, deletedStale)
         assertEquals(1, roomDb.fileFingerprintDao().countByFolder("room-migrated-1"))
+        assertNotNull(roomDb.fileFingerprintDao().getByFolderAndDocument("room-migrated-1", "raw-doc-1"))
+        assertNull(roomDb.fileFingerprintDao().getByFolderAndDocument("room-migrated-1", "deleted-doc-99"))
 
         val deletedByFolder = roomDb.fileFingerprintDao().deleteByFolderId("room-migrated-1")
         assertEquals(1, deletedByFolder)
