@@ -61,13 +61,21 @@ Questo file è il punto di coordinamento condiviso per lo sviluppo di OONI-Sync.
 - Non confondere "compilazione dei test riuscita" con "test superati".
 - Non considerare una run di un commit precedente come prova del commit corrente.
 
-## 5. Baseline e stato noto al momento della creazione
+## 5. Stato corrente e baseline ufficiale
 
-- La fase in lavorazione è **Fase 1B.3A — Database v4 e motore SHA-256 di base**.
-- La revisione rev3 è stata pubblicata nel commit `0958ed642a643fda10574e378a263dde0969fd7e`.
-- Lo ZIP consegnato da Gemini per rev3 dichiara SHA-256 `7808fb1ed9b23a01b27e10d43b906d2cd4e7b7e57338b33c76f7542fa0504314`. L'hash dello ZIP non dimostra da solo la correttezza del codice.
-- Le modifiche rev3 riguardano `ScannedDocumentDao.kt`, `LocalFolderScanner.kt` e `LocalFolderScannerTest.kt`.
-- La CI associata al commit rev3 deve essere controllata su GitHub Actions: al momento dell'ultimo controllo risultava in esecuzione. Verificare sempre lo stato live prima di assumere che sia ancora in corso o terminata.
+- **Fase completata e verificata:** **Fase 1B.3C — Integrazione del fingerprinting nella pipeline di scansione**.
+- **Ultimo commit ufficiale e baseline corrente (`main`):** `73b7c16537920dee3395c708360bafebef5e4431`.
+- **Database:** Room schema v4, senza migrazioni pendenti.
+- **Stato CI (GitHub Actions Run #12 associata alla baseline):** successo.
+  - `:app:testDebugUnitTest`: 134 test superati.
+  - `:app:assembleDebug`: `BUILD SUCCESSFUL`.
+  - Artifact dei report e APK debug caricati correttamente.
+- **Avanzamento:** nessuna nuova fase di sviluppo è attualmente iniziata.
+- **Prossima attività:** qualsiasi nuova attività dovrà essere preceduta da una specifica progettuale approvata.
+
+### Riferimento storico (stato iniziale alla creazione del file — superato)
+
+- La precedente descrizione iniziale si riferiva alla **Fase 1B.3A — Database v4 e motore SHA-256 di base** (revisione rev3 sul commit `0958ed642a643fda10574e378a263dde0969fd7e`, ZIP con SHA-256 `7808fb1ed9b23a01b27e10d43b906d2cd4e7b7e57338b33c76f7542fa0504314`, interventi su `ScannedDocumentDao.kt`, `LocalFolderScanner.kt` e `LocalFolderScannerTest.kt`). Tali informazioni hanno valore esclusivamente storico e non rappresentano più lo stato corrente del repository.
 
 ## 6. Sicurezza e integrità
 
