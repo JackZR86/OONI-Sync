@@ -76,6 +76,7 @@ fun DriveAccountCard(
     feedbackMessage: String?,
     errorMessage: String?,
     remoteRevokeFailedMessage: String?,
+    localCleanupFailedMessage: String? = null,
     onConnectAccount: () -> Unit,
     onVerifyConnection: () -> Unit,
     onSwitchAccount: () -> Unit,
@@ -477,6 +478,47 @@ fun DriveAccountCard(
                             ) {
                                 Text("Scollega solo localmente")
                             }
+                        }
+                    }
+                }
+            }
+
+            // Gestione esplicita revoca remota riuscita ma pulizia locale fallita: consente scollegamento locale
+            if (!localCleanupFailedMessage.isNullOrBlank() && currentAccount != null) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Surface(
+                    color = MaterialTheme.colorScheme.secondaryContainer,
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Filled.Warning,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.secondary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "Revoca remota riuscita (pulizia locale incompleta)",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = localCleanupFailedMessage,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Button(
+                            onClick = onConfirmLocalOnlyDisconnect,
+                            enabled = !isBusy
+                        ) {
+                            Text("Completa scollegamento locale")
                         }
                     }
                 }

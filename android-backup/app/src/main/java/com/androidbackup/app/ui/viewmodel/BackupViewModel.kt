@@ -67,7 +67,8 @@ data class BackupUiState(
     val driveSessionAuthState: DriveSessionAuthState = DriveSessionAuthState.Initializing,
     val driveFeedbackMessage: String? = null,
     val driveErrorMessage: String? = null,
-    val driveRemoteRevokeFailedMessage: String? = null
+    val driveRemoteRevokeFailedMessage: String? = null,
+    val driveLocalCleanupFailedMessage: String? = null
 )
 
 /**
@@ -100,6 +101,7 @@ class BackupViewModel(
     private val _realFolders = MutableStateFlow<List<BackupSource>>(emptyList())
     private var simulationJob: Job? = null
     private var isDriveOperationDispatching = false
+    private val _pendingDriveAuthFlow = MutableStateFlow(readPendingDriveAuthRequest())
 
     init {
         // 1. Osserva costantemente le impostazioni reali dal repository Room
@@ -160,16 +162,15 @@ class BackupViewModel(
             viewModelScope.launch {
                 kotlinx.coroutines.flow.combine(
                     driveAccountRepository.observeSessionAuthState(),
-                    savedStateHandle.getStateFlow<String?>(KEY_PENDING_AUTH_PURPOSE, null)
-                ) { repoState, _ ->
-                    val restoredPending = readPendingDriveAuthRequest()
+                    _pendingDriveAuthFlow
+                ) { repoState, pendingRequest ->
                     if (
-                        restoredPending != null &&
+                        pendingRequest != null &&
                         repoState !is DriveSessionAuthState.InProgress &&
                         repoState !is DriveSessionAuthState.Disconnecting
                     ) {
                         DriveSessionAuthState.InProgress(
-                            purpose = restoredPending.purpose,
+                            purpose = pendingRequest.purpose,
                             existingAccount = extractAccountFromSessionState(repoState)
                         )
                     } else {
@@ -783,21 +784,16 @@ class BackupViewModel(
         val repo = driveAccountRepository ?: return
         if (isDriveFlowBusy()) return
 
-        val existingAccount = extractAccountFromSessionState(_uiState.value.driveSessionAuthState)
-        val initialRequest = PendingDriveAuthRequest(
-            purpose = purpose,
-            expectedPermissionId = existingAccount?.permissionId,
-            targetEmail = if (purpose == DriveAuthFlowPurpose.REVERIFY) existingAccount?.emailAddress else null,
-            retryUsed = false
-        )
-
+        // Non salvare in SavedStateHandle prima di ottenere una PendingIntent reale (NeedsResolution):
+        // la protezione concorrente durante authorizeInteractive è già garantita da isDriveOperationDispatching
+        // e dallo stato InProgress + Mutex del repository.
         isDriveOperationDispatching = true
-        savePendingDriveAuthRequest(initialRequest)
         _uiState.update {
             it.copy(
                 driveFeedbackMessage = null,
                 driveErrorMessage = null,
-                driveRemoteRevokeFailedMessage = null
+                driveRemoteRevokeFailedMessage = null,
+                driveLocalCleanupFailedMessage = null
             )
         }
 
@@ -875,7 +871,8 @@ class BackupViewModel(
                     it.copy(
                         driveFeedbackMessage = msg,
                         driveErrorMessage = null,
-                        driveRemoteRevokeFailedMessage = null
+                        driveRemoteRevokeFailedMessage = null,
+                        driveLocalCleanupFailedMessage = null
                     )
                 }
             }
@@ -916,7 +913,8 @@ class BackupViewModel(
             it.copy(
                 driveFeedbackMessage = null,
                 driveErrorMessage = null,
-                driveRemoteRevokeFailedMessage = null
+                driveRemoteRevokeFailedMessage = null,
+                driveLocalCleanupFailedMessage = null
             )
         }
 
@@ -928,7 +926,19 @@ class BackupViewModel(
                             it.copy(
                                 driveFeedbackMessage = "Accesso Google Drive revocato e account scollegato.",
                                 driveErrorMessage = null,
-                                driveRemoteRevokeFailedMessage = null
+                                driveRemoteRevokeFailedMessage = null,
+                                driveLocalCleanupFailedMessage = null
+                            )
+                        }
+                    }
+
+                    is DriveDisconnectOutcome.RemoteRevokeSucceededLocalCleanupFailed -> {
+                        _uiState.update {
+                            it.copy(
+                                driveLocalCleanupFailedMessage = outcome.reason,
+                                driveRemoteRevokeFailedMessage = null,
+                                driveErrorMessage = null,
+                                driveFeedbackMessage = null
                             )
                         }
                     }
@@ -937,6 +947,7 @@ class BackupViewModel(
                         _uiState.update {
                             it.copy(
                                 driveRemoteRevokeFailedMessage = outcome.reason,
+                                driveLocalCleanupFailedMessage = null,
                                 driveFeedbackMessage = null
                             )
                         }
@@ -946,7 +957,8 @@ class BackupViewModel(
                         _uiState.update {
                             it.copy(
                                 driveFeedbackMessage = "Associazione locale rimossa. L'autorizzazione Google potrebbe restare attiva nelle impostazioni del tuo Account Google.",
-                                driveRemoteRevokeFailedMessage = null
+                                driveRemoteRevokeFailedMessage = null,
+                                driveLocalCleanupFailedMessage = null
                             )
                         }
                     }
@@ -967,19 +979,45 @@ class BackupViewModel(
             it.copy(
                 driveFeedbackMessage = null,
                 driveErrorMessage = null,
-                driveRemoteRevokeFailedMessage = null
+                driveRemoteRevokeFailedMessage = null,
+                driveLocalCleanupFailedMessage = null
             )
         }
 
         viewModelScope.launch {
             try {
-                repo.confirmLocalOnlyDisconnect()
-                _uiState.update {
-                    it.copy(
-                        driveFeedbackMessage = "Account scollegato solo localmente. Puoi revocare manualmente l'accesso dalle impostazioni di sicurezza del tuo Account Google.",
-                        driveErrorMessage = null,
-                        driveRemoteRevokeFailedMessage = null
-                    )
+                when (val outcome = repo.confirmLocalOnlyDisconnect()) {
+                    DriveDisconnectOutcome.LocalUnlinkOnly,
+                    DriveDisconnectOutcome.RemoteRevokeSucceeded -> {
+                        _uiState.update {
+                            it.copy(
+                                driveFeedbackMessage = "Account scollegato solo localmente. Puoi revocare manualmente l'accesso dalle impostazioni di sicurezza del tuo Account Google.",
+                                driveErrorMessage = null,
+                                driveRemoteRevokeFailedMessage = null,
+                                driveLocalCleanupFailedMessage = null
+                            )
+                        }
+                    }
+
+                    is DriveDisconnectOutcome.RemoteRevokeSucceededLocalCleanupFailed -> {
+                        _uiState.update {
+                            it.copy(
+                                driveLocalCleanupFailedMessage = outcome.reason,
+                                driveRemoteRevokeFailedMessage = null,
+                                driveErrorMessage = null,
+                                driveFeedbackMessage = null
+                            )
+                        }
+                    }
+
+                    is DriveDisconnectOutcome.RemoteRevokeFailed -> {
+                        _uiState.update {
+                            it.copy(
+                                driveErrorMessage = outcome.reason,
+                                driveFeedbackMessage = null
+                            )
+                        }
+                    }
                 }
             } finally {
                 isDriveOperationDispatching = false
@@ -1042,7 +1080,8 @@ class BackupViewModel(
             it.copy(
                 driveFeedbackMessage = null,
                 driveErrorMessage = null,
-                driveRemoteRevokeFailedMessage = null
+                driveRemoteRevokeFailedMessage = null,
+                driveLocalCleanupFailedMessage = null
             )
         }
     }
@@ -1064,6 +1103,7 @@ class BackupViewModel(
         savedStateHandle[KEY_PENDING_EXPECTED_PERMISSION_ID] = request.expectedPermissionId
         savedStateHandle[KEY_PENDING_TARGET_EMAIL] = request.targetEmail
         savedStateHandle[KEY_PENDING_RETRY_USED] = request.retryUsed
+        _pendingDriveAuthFlow.value = request
     }
 
     private fun readPendingDriveAuthRequest(): PendingDriveAuthRequest? {
@@ -1086,6 +1126,7 @@ class BackupViewModel(
         savedStateHandle.remove<String>(KEY_PENDING_EXPECTED_PERMISSION_ID)
         savedStateHandle.remove<String>(KEY_PENDING_TARGET_EMAIL)
         savedStateHandle.remove<Boolean>(KEY_PENDING_RETRY_USED)
+        _pendingDriveAuthFlow.value = null
     }
 
     private fun extractAccountFromSessionState(state: DriveSessionAuthState): LinkedDriveAccount? {

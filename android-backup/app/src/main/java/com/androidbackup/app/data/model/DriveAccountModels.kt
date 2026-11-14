@@ -131,6 +131,12 @@ sealed interface DriveDisconnectOutcome {
     /** Revoca remota via AuthorizationClient riuscita e riga Room rimossa. */
     data object RemoteRevokeSucceeded : DriveDisconnectOutcome
 
+    /**
+     * Revoca remota su Google riuscita, ma la rimozione locale in Room è fallita.
+     * L'account residuo non viene presentato come autorizzato e può essere scollegato localmente.
+     */
+    data class RemoteRevokeSucceededLocalCleanupFailed(val reason: String) : DriveDisconnectOutcome
+
     /** Revoca remota fallita: la riga Room è stata preservata. */
     data class RemoteRevokeFailed(val reason: String) : DriveDisconnectOutcome
 

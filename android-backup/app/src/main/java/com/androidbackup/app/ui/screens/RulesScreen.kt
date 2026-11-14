@@ -97,6 +97,7 @@ fun RulesScreen(
                 feedbackMessage = uiState.driveFeedbackMessage,
                 errorMessage = uiState.driveErrorMessage,
                 remoteRevokeFailedMessage = uiState.driveRemoteRevokeFailedMessage,
+                localCleanupFailedMessage = uiState.driveLocalCleanupFailedMessage,
                 onConnectAccount = { viewModel.connectDriveAccount() },
                 onVerifyConnection = { viewModel.verifyDriveConnection() },
                 onSwitchAccount = { viewModel.switchDriveAccount() },

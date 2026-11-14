@@ -18,6 +18,8 @@ class FakeLinkedDriveAccountDao(
     var writeCount: Int = 0
         private set
 
+    var deleteAllException: Exception? = null
+
     override fun observeAccount(id: Int): Flow<LinkedDriveAccountEntity?> = accountState.asStateFlow()
 
     override suspend fun getAccount(id: Int): LinkedDriveAccountEntity? =
@@ -46,6 +48,7 @@ class FakeLinkedDriveAccountDao(
     }
 
     override suspend fun deleteAll() {
+        deleteAllException?.let { throw it }
         writeCount++
         accountState.value = null
     }

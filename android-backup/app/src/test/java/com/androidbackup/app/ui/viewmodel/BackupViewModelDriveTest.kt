@@ -4,7 +4,12 @@ import android.app.Activity
 import android.app.PendingIntent
 import android.content.Intent
 import android.content.IntentSender
+import android.database.sqlite.SQLiteException
 import androidx.lifecycle.SavedStateHandle
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.ViewModelStoreOwner
 import androidx.test.core.app.ApplicationProvider
 import com.androidbackup.app.data.drive.DriveAuthGateway
 import com.androidbackup.app.data.drive.DriveGatewayAuthResult
@@ -24,11 +29,14 @@ import com.androidbackup.app.data.repository.SettingsRepository
 import com.androidbackup.app.testutils.FakeLinkedDriveAccountDao
 import com.androidbackup.app.testutils.FakeSettingsDao
 import com.androidbackup.app.testutils.MainDispatcherRule
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -69,6 +77,7 @@ class BackupViewModelDriveTest {
         var silentQueue = ArrayDeque<DriveGatewayAuthResult>()
         var extractQueue = ArrayDeque<DriveGatewayAuthResult>()
         var revokeResult: DriveGatewayRevokeResult = DriveGatewayRevokeResult.Succeeded
+        var customAuthorizeInteractive: (suspend (String?, Boolean) -> DriveGatewayAuthResult)? = null
 
         override fun checkPlayServicesAvailability(): PlayServicesAvailabilityStatus =
             PlayServicesAvailabilityStatus.Available
@@ -78,6 +87,7 @@ class BackupViewModelDriveTest {
             promptSelectAccount: Boolean
         ): DriveGatewayAuthResult {
             interactiveCalls.add(targetEmail to promptSelectAccount)
+            customAuthorizeInteractive?.let { return it(targetEmail, promptSelectAccount) }
             return if (interactiveQueue.isNotEmpty()) {
                 interactiveQueue.removeFirst()
             } else {
@@ -182,13 +192,18 @@ class BackupViewModelDriveTest {
 
         val vm1 = BackupViewModel(settingsRepo, driveAccountRepository = driveRepo1, savedStateHandle = savedStateHandle)
         vm1.toggleDemoMode(false)
+        advanceUntilIdle()
+        assertEquals(DriveSessionAuthState.NotLinked, vm1.uiState.value.driveSessionAuthState)
 
         val eventsVm1 = mutableListOf<DriveAuthUiEvent>()
-        val collectJob1 = backgroundScope.launch {
+        val collectJob1 = backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
             vm1.driveAuthEvents.collect { eventsVm1.add(it) }
         }
+        runCurrent()
 
         vm1.connectDriveAccount()
+        advanceUntilIdle()
+        runCurrent()
 
         // Evento one-shot emesso esattamente una volta; SavedStateHandle ha solo metadati testuali/booleani
         assertEquals(1, eventsVm1.size)
@@ -206,11 +221,13 @@ class BackupViewModelDriveTest {
         val driveRepo2 = DriveAccountRepository(dao, gateway, identityClient, io) { 6000L }
         val vm2 = BackupViewModel(settingsRepo, driveAccountRepository = driveRepo2, savedStateHandle = savedStateHandle)
         vm2.toggleDemoMode(false)
+        advanceUntilIdle()
 
         val eventsVm2 = mutableListOf<DriveAuthUiEvent>()
-        val collectJob2 = backgroundScope.launch {
+        val collectJob2 = backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
             vm2.driveAuthEvents.collect { eventsVm2.add(it) }
         }
+        runCurrent()
 
         // Il ViewModel ricreato NON ri-emette la PendingIntent e mantiene stato InProgress + blocco concorrenza
         assertTrue(eventsVm2.isEmpty())
@@ -218,10 +235,13 @@ class BackupViewModelDriveTest {
 
         val callsBeforeConcurrentAttempt = gateway.interactiveCalls.size
         vm2.connectDriveAccount()
+        advanceUntilIdle()
         assertEquals(callsBeforeConcurrentAttempt, gateway.interactiveCalls.size)
 
         // Al rientro dell'ActivityResult, completa il flusso
         vm2.onDriveAuthorizationActivityResult(Activity.RESULT_OK, Intent())
+        advanceUntilIdle()
+        runCurrent()
 
         assertTrue(vm2.uiState.value.driveSessionAuthState is DriveSessionAuthState.VerifiedInSession)
         assertEquals("perm-recreated", dao.getAccount()?.permissionId)
@@ -247,9 +267,12 @@ class BackupViewModelDriveTest {
 
         val recreatedVm = BackupViewModel(settingsRepo, driveAccountRepository = driveRepoAfterDeath, savedStateHandle = restoredHandle)
         recreatedVm.toggleDemoMode(false)
+        advanceUntilIdle()
         assertTrue(recreatedVm.uiState.value.driveSessionAuthState is DriveSessionAuthState.InProgress)
 
         recreatedVm.onDriveAuthorizationActivityResult(Activity.RESULT_CANCELED, null)
+        advanceUntilIdle()
+        runCurrent()
 
         assertEquals(DriveSessionAuthState.NotLinked, recreatedVm.uiState.value.driveSessionAuthState)
         assertNull(restoredHandle.get<String>(BackupViewModel.KEY_PENDING_AUTH_PURPOSE))
@@ -281,16 +304,25 @@ class BackupViewModelDriveTest {
             savedStateHandle = savedStateHandle
         )
         vm1.toggleDemoMode(false)
+        advanceUntilIdle()
+        assertTrue(vm1.uiState.value.driveSessionAuthState is DriveSessionAuthState.LinkedUnverifiedInSession)
 
         val events = mutableListOf<DriveAuthUiEvent>()
-        val job = backgroundScope.launch { vm1.driveAuthEvents.collect { events.add(it) } }
+        val job = backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            vm1.driveAuthEvents.collect { events.add(it) }
+        }
+        runCurrent()
 
         // Avvio REVERIFY -> 1a PendingIntent
         vm1.verifyDriveConnection()
+        advanceUntilIdle()
+        runCurrent()
         assertEquals(1, events.size)
 
         // Rientro 1a PendingIntent -> 401 -> clearToken -> 2a PendingIntent con retryUsed=true
         vm1.onDriveAuthorizationActivityResult(Activity.RESULT_OK, Intent())
+        advanceUntilIdle()
+        runCurrent()
         assertEquals(2, events.size)
         assertEquals(listOf("tok-401-a"), gateway.clearedTokens)
         assertEquals(true, savedStateHandle.get<Boolean>(BackupViewModel.KEY_PENDING_RETRY_USED))
@@ -305,15 +337,142 @@ class BackupViewModelDriveTest {
             savedStateHandle = savedStateHandle
         )
         vm2.toggleDemoMode(false)
+        advanceUntilIdle()
         assertTrue(vm2.uiState.value.driveSessionAuthState is DriveSessionAuthState.InProgress)
 
         vm2.onDriveAuthorizationActivityResult(Activity.RESULT_OK, Intent())
+        advanceUntilIdle()
+        runCurrent()
 
         // Deve fermarsi dopo il secondo 401 senza ulteriori retry né loop
         assertEquals(listOf("tok-401-a"), gateway.clearedTokens)
         assertNull(savedStateHandle.get<String>(BackupViewModel.KEY_PENDING_AUTH_PURPOSE))
         assertNotNull(vm2.uiState.value.driveErrorMessage)
         assertTrue(vm2.uiState.value.driveSessionAuthState is DriveSessionAuthState.ReauthRequired)
+    }
+
+    @Test
+    fun cancellationBeforeNeedsResolution_doesNotLeavePendingRequestInSavedStateHandle() = runTest {
+        val io = UnconfinedTestDispatcher(testScheduler)
+        val dao = FakeLinkedDriveAccountDao(null)
+        val enteredInteractive = CompletableDeferred<Unit>()
+        val releaseInteractive = CompletableDeferred<DriveGatewayAuthResult>()
+
+        val gateway = FakeVmDriveAuthGateway().apply {
+            customAuthorizeInteractive = { _, _ ->
+                if (!enteredInteractive.isCompleted) {
+                    enteredInteractive.complete(Unit)
+                    releaseInteractive.await()
+                } else {
+                    DriveGatewayAuthResult.NeedsUserInteraction(createTestIntentSender(99))
+                }
+            }
+        }
+        val settingsRepo = SettingsRepository(FakeSettingsDao(), io)
+        val driveRepo = DriveAccountRepository(dao, gateway, FakeVmDriveIdentityClient(), io)
+        val savedStateHandle = SavedStateHandle()
+
+        val owner = object : ViewModelStoreOwner {
+            override val viewModelStore = ViewModelStore()
+        }
+        val factory = object : ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <T : ViewModel> create(modelClass: Class<T>): T {
+                return BackupViewModel(settingsRepo, driveAccountRepository = driveRepo, savedStateHandle = savedStateHandle) as T
+            }
+        }
+        val vm = ViewModelProvider(owner, factory)[BackupViewModel::class.java]
+        vm.toggleDemoMode(false)
+        advanceUntilIdle()
+
+        vm.connectDriveAccount()
+        enteredInteractive.await()
+        runCurrent()
+
+        // Mentre authorizeInteractive è ancora in corso e NeedsResolution non è arrivato,
+        // SavedStateHandle NON deve contenere alcuna richiesta pendente fittizia.
+        assertTrue(vm.uiState.value.driveSessionAuthState is DriveSessionAuthState.InProgress)
+        assertNull(savedStateHandle.get<String>(BackupViewModel.KEY_PENDING_AUTH_PURPOSE))
+        assertNull(savedStateHandle.get<String>(BackupViewModel.KEY_PENDING_EXPECTED_PERMISSION_ID))
+        assertNull(savedStateHandle.get<String>(BackupViewModel.KEY_PENDING_TARGET_EMAIL))
+        assertNull(savedStateHandle.get<Boolean>(BackupViewModel.KEY_PENDING_RETRY_USED))
+
+        // Cancella il ViewModel prima della restituzione di NeedsResolution
+        owner.viewModelStore.clear()
+        advanceUntilIdle()
+
+        assertNull(savedStateHandle.get<String>(BackupViewModel.KEY_PENDING_AUTH_PURPOSE))
+        assertNull(savedStateHandle.get<Boolean>(BackupViewModel.KEY_PENDING_RETRY_USED))
+        assertEquals(DriveSessionAuthState.NotLinked, driveRepo.observeSessionAuthState().let { flow ->
+            var latest: DriveSessionAuthState? = null
+            val job = backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+                flow.collect { latest = it }
+            }
+            runCurrent()
+            job.cancel()
+            latest
+        })
+
+        // Un nuovo ViewModel con lo stesso SavedStateHandle riparte pulito in NotLinked e può avviare un nuovo flusso
+        val recreatedVm = BackupViewModel(settingsRepo, driveAccountRepository = driveRepo, savedStateHandle = savedStateHandle)
+        recreatedVm.toggleDemoMode(false)
+        advanceUntilIdle()
+        assertEquals(DriveSessionAuthState.NotLinked, recreatedVm.uiState.value.driveSessionAuthState)
+
+        val eventsAfter = mutableListOf<DriveAuthUiEvent>()
+        val collectAfter = backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            recreatedVm.driveAuthEvents.collect { eventsAfter.add(it) }
+        }
+        recreatedVm.connectDriveAccount()
+        advanceUntilIdle()
+        runCurrent()
+        assertEquals(1, eventsAfter.size)
+        assertEquals(DriveAuthFlowPurpose.INITIAL_LINK.name, savedStateHandle.get<String>(BackupViewModel.KEY_PENDING_AUTH_PURPOSE))
+        collectAfter.cancel()
+    }
+
+    @Test
+    fun cancellationExceptionFromGatewayBeforeNeedsResolution_leavesSavedStateHandleCleanAndRestoresState() = runTest {
+        val io = UnconfinedTestDispatcher(testScheduler)
+        val dao = FakeLinkedDriveAccountDao(null)
+        var shouldCancel = true
+        val gateway = FakeVmDriveAuthGateway().apply {
+            customAuthorizeInteractive = { _, _ ->
+                if (shouldCancel) {
+                    throw CancellationException("Annullamento interno prima di NeedsResolution")
+                }
+                DriveGatewayAuthResult.NeedsUserInteraction(createTestIntentSender(77))
+            }
+        }
+        val savedStateHandle = SavedStateHandle()
+        val vm = BackupViewModel(
+            settingsRepository = SettingsRepository(FakeSettingsDao(), io),
+            driveAccountRepository = DriveAccountRepository(dao, gateway, FakeVmDriveIdentityClient(), io),
+            savedStateHandle = savedStateHandle
+        )
+
+        vm.toggleDemoMode(false)
+        advanceUntilIdle()
+
+        vm.connectDriveAccount()
+        advanceUntilIdle()
+        runCurrent()
+
+        assertNull(savedStateHandle.get<String>(BackupViewModel.KEY_PENDING_AUTH_PURPOSE))
+        assertEquals(DriveSessionAuthState.NotLinked, vm.uiState.value.driveSessionAuthState)
+
+        shouldCancel = false
+        val events = mutableListOf<DriveAuthUiEvent>()
+        val collectJob = backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            vm.driveAuthEvents.collect { events.add(it) }
+        }
+        vm.connectDriveAccount()
+        advanceUntilIdle()
+        runCurrent()
+
+        assertEquals(1, events.size)
+        assertEquals(DriveAuthFlowPurpose.INITIAL_LINK.name, savedStateHandle.get<String>(BackupViewModel.KEY_PENDING_AUTH_PURPOSE))
+        collectJob.cancel()
     }
 
     @Test
@@ -329,8 +488,11 @@ class BackupViewModelDriveTest {
             savedStateHandle = SavedStateHandle()
         )
         vm.toggleDemoMode(false)
+        advanceUntilIdle()
 
         vm.onDriveAuthorizationActivityResult(Activity.RESULT_OK, Intent())
+        advanceUntilIdle()
+        runCurrent()
 
         assertEquals(0, dao.writeCount)
         assertNull(dao.getAccount())
@@ -348,6 +510,7 @@ class BackupViewModelDriveTest {
             driveAccountRepository = DriveAccountRepository(dao, gateway, identityClient, io),
             savedStateHandle = SavedStateHandle()
         )
+        advanceUntilIdle()
 
         // Default all'avvio: isDemoMode == true
         assertTrue(vm.uiState.value.isDemoMode)
@@ -358,6 +521,7 @@ class BackupViewModelDriveTest {
         vm.disconnectDriveAccountWithRemoteRevoke()
         vm.confirmLocalOnlyDriveDisconnect()
         vm.runDebugSilentDriveTokenCheck()
+        advanceUntilIdle()
 
         assertTrue(gateway.interactiveCalls.isEmpty())
         assertTrue(gateway.silentCalls.isEmpty())
@@ -382,25 +546,73 @@ class BackupViewModelDriveTest {
             savedStateHandle = SavedStateHandle()
         )
         vm.toggleDemoMode(false)
+        advanceUntilIdle()
 
         val events = mutableListOf<DriveAuthUiEvent>()
-        val job = backgroundScope.launch { vm.driveAuthEvents.collect { events.add(it) } }
+        val job = backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            vm.driveAuthEvents.collect { events.add(it) }
+        }
+        runCurrent()
 
         // Test silenzioso debug (no UI) -> verifica senza emettere alcuna PendingIntent
         vm.runDebugSilentDriveTokenCheck()
+        advanceUntilIdle()
+        runCurrent()
         assertTrue(events.isEmpty())
         assertTrue(vm.uiState.value.driveSessionAuthState is DriveSessionAuthState.VerifiedInSession)
 
         // Disconnessione remota fallisce -> preserva Room e espone messaggio per scelta esplicita
         vm.disconnectDriveAccountWithRemoteRevoke()
+        advanceUntilIdle()
+        runCurrent()
         assertNotNull(vm.uiState.value.driveRemoteRevokeFailedMessage)
         assertNotNull(dao.getAccount())
 
         // Conferma esplicita scollegamento locale -> rimuove Room e transisce a NotLinked
         vm.confirmLocalOnlyDriveDisconnect()
+        advanceUntilIdle()
+        runCurrent()
         assertNull(dao.getAccount())
         assertNull(vm.uiState.value.driveRemoteRevokeFailedMessage)
         assertEquals(DriveSessionAuthState.NotLinked, vm.uiState.value.driveSessionAuthState)
         job.cancel()
+    }
+
+    @Test
+    fun disconnectRemoteRevokeSucceededButLocalCleanupFailed_updatesDedicatedState_andAllowsLocalDisconnect() = runTest {
+        val io = UnconfinedTestDispatcher(testScheduler)
+        val dao = FakeLinkedDriveAccountDao(sampleEntity(permissionId = "perm-1", email = "user1@example.com")).apply {
+            deleteAllException = SQLiteException("Simulated SQLite error on deleteAll")
+        }
+        val gateway = FakeVmDriveAuthGateway().apply {
+            revokeResult = DriveGatewayRevokeResult.Succeeded
+        }
+        val vm = BackupViewModel(
+            settingsRepository = SettingsRepository(FakeSettingsDao(), io),
+            driveAccountRepository = DriveAccountRepository(dao, gateway, FakeVmDriveIdentityClient(), io),
+            savedStateHandle = SavedStateHandle()
+        )
+        vm.toggleDemoMode(false)
+        advanceUntilIdle()
+
+        vm.disconnectDriveAccountWithRemoteRevoke()
+        advanceUntilIdle()
+        runCurrent()
+
+        assertNotNull(vm.uiState.value.driveLocalCleanupFailedMessage)
+        assertNull(vm.uiState.value.driveRemoteRevokeFailedMessage)
+        assertNull(vm.uiState.value.driveErrorMessage)
+        assertTrue(vm.uiState.value.driveSessionAuthState is DriveSessionAuthState.ReauthRequired)
+        assertEquals(PersistedDriveCheckOutcome.REAUTH_REQUIRED.name, dao.getAccount()?.lastPersistedOutcome)
+
+        // Dopo il ripristino del DB, la conferma locale completa lo scollegamento
+        dao.deleteAllException = null
+        vm.confirmLocalOnlyDriveDisconnect()
+        advanceUntilIdle()
+        runCurrent()
+
+        assertNull(dao.getAccount())
+        assertNull(vm.uiState.value.driveLocalCleanupFailedMessage)
+        assertEquals(DriveSessionAuthState.NotLinked, vm.uiState.value.driveSessionAuthState)
     }
 }

@@ -3,6 +3,7 @@ package com.androidbackup.app.data.repository
 import android.app.PendingIntent
 import android.content.Intent
 import android.content.IntentSender
+import android.database.sqlite.SQLiteException
 import androidx.test.core.app.ApplicationProvider
 import com.androidbackup.app.data.drive.DriveAuthGateway
 import com.androidbackup.app.data.drive.DriveGatewayAuthResult
@@ -20,11 +21,15 @@ import com.androidbackup.app.data.model.DriveUserIdentity
 import com.androidbackup.app.data.model.PendingDriveAuthRequest
 import com.androidbackup.app.data.model.PersistedDriveCheckOutcome
 import com.androidbackup.app.testutils.FakeLinkedDriveAccountDao
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -58,6 +63,8 @@ class DriveAccountRepositoryTest {
         var silentQueue = ArrayDeque<DriveGatewayAuthResult>()
         var extractedResult: DriveGatewayAuthResult = DriveGatewayAuthResult.Cancelled
         var revokeResult: DriveGatewayRevokeResult = DriveGatewayRevokeResult.Succeeded
+        var customAuthorizeInteractive: (suspend (String?, Boolean) -> DriveGatewayAuthResult)? = null
+        var customRevokeAccess: (suspend (String) -> DriveGatewayRevokeResult)? = null
 
         override fun checkPlayServicesAvailability(): PlayServicesAvailabilityStatus =
             PlayServicesAvailabilityStatus.Available
@@ -67,6 +74,7 @@ class DriveAccountRepositoryTest {
             promptSelectAccount: Boolean
         ): DriveGatewayAuthResult {
             interactiveCalls.add(targetEmail to promptSelectAccount)
+            customAuthorizeInteractive?.let { return it(targetEmail, promptSelectAccount) }
             return if (interactiveQueue.isNotEmpty()) {
                 interactiveQueue.removeFirst()
             } else {
@@ -92,6 +100,7 @@ class DriveAccountRepositoryTest {
 
         override suspend fun revokeAccess(emailAddress: String): DriveGatewayRevokeResult {
             revokedEmails.add(emailAddress)
+            customRevokeAccess?.let { return it(emailAddress) }
             return revokeResult
         }
     }
@@ -99,9 +108,11 @@ class DriveAccountRepositoryTest {
     private class FakeDriveIdentityClient : DriveIdentityClient {
         val requestedTokens = mutableListOf<String>()
         var responses = ArrayDeque<Result<DriveUserIdentity>>()
+        var customFetchUserIdentity: (suspend (String) -> DriveUserIdentity)? = null
 
         override suspend fun fetchUserIdentity(accessToken: String): DriveUserIdentity {
             requestedTokens.add(accessToken)
+            customFetchUserIdentity?.let { return it(accessToken) }
             val next = if (responses.isNotEmpty()) responses.removeFirst()
             else Result.failure(DriveIdentityException.NetworkError("Nessuna risposta mock"))
             return next.getOrThrow()
@@ -473,5 +484,232 @@ class DriveAccountRepositoryTest {
         assertEquals(DriveDisconnectOutcome.LocalUnlinkOnly, localOnly)
         assertTrue(gwNoEmail.revokedEmails.isEmpty())
         assertNull(daoNoEmail.getAccount())
+    }
+
+    @Test
+    fun cancellationDuringBeginInteractiveAuthorization_restoresNonBusyStateAndAllowsNextOperation() = runTest {
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        val dao = FakeLinkedDriveAccountDao(null)
+        val entered = CompletableDeferred<Unit>()
+        val gate = CompletableDeferred<DriveGatewayAuthResult>()
+        val gateway = FakeDriveAuthGateway().apply {
+            customAuthorizeInteractive = { _, _ ->
+                if (!entered.isCompleted) {
+                    entered.complete(Unit)
+                    gate.await()
+                } else {
+                    DriveGatewayAuthResult.Authorized("tok-after-cancel", listOf(DriveOAuthConstants.DRIVE_FILE_SCOPE))
+                }
+            }
+        }
+        val identityClient = FakeDriveIdentityClient().apply {
+            responses.addLast(Result.success(DriveUserIdentity("perm-ok", "after@example.com", "After Cancel")))
+        }
+        val repo = DriveAccountRepository(dao, gateway, identityClient, dispatcher)
+
+        val job = launch(dispatcher) {
+            repo.beginInteractiveAuthorization(DriveAuthFlowPurpose.INITIAL_LINK)
+        }
+        entered.await()
+        assertTrue(repo.observeSessionAuthState().first() is DriveSessionAuthState.InProgress)
+
+        job.cancelAndJoin()
+        assertTrue(job.isCancelled)
+        assertEquals(DriveSessionAuthState.NotLinked, repo.observeSessionAuthState().first())
+        assertNull(dao.getAccount())
+        assertEquals(0, dao.writeCount)
+
+        // Una nuova operazione legittima deve avviarsi e completarsi senza restare bloccata
+        val nextOutcome = repo.beginInteractiveAuthorization(DriveAuthFlowPurpose.INITIAL_LINK)
+        assertTrue(nextOutcome is DriveAuthStepOutcome.Completed)
+        assertTrue(repo.observeSessionAuthState().first() is DriveSessionAuthState.VerifiedInSession)
+        assertEquals("perm-ok", dao.getAccount()?.permissionId)
+    }
+
+    @Test
+    fun cancellationDuringCompleteAuthorizationFromIntentHttpVerify_restoresNonBusyStatePreservesRoomAndAllowsNextOperation() = runTest {
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        val initial = sampleEntity(permissionId = "perm-1", email = "user1@example.com")
+        val dao = FakeLinkedDriveAccountDao(initial)
+        val enteredHttp = CompletableDeferred<Unit>()
+        val httpGate = CompletableDeferred<DriveUserIdentity>()
+        val gateway = FakeDriveAuthGateway().apply {
+            interactiveQueue.addLast(DriveGatewayAuthResult.NeedsUserInteraction(createTestIntentSender()))
+            interactiveQueue.addLast(
+                DriveGatewayAuthResult.Authorized("tok-retry-ok", listOf(DriveOAuthConstants.DRIVE_FILE_SCOPE))
+            )
+            extractedResult = DriveGatewayAuthResult.Authorized("tok-1", listOf(DriveOAuthConstants.DRIVE_FILE_SCOPE))
+        }
+        var firstHttpCall = true
+        val identityClient = FakeDriveIdentityClient().apply {
+            customFetchUserIdentity = {
+                if (firstHttpCall) {
+                    firstHttpCall = false
+                    enteredHttp.complete(Unit)
+                    httpGate.await()
+                } else {
+                    DriveUserIdentity("perm-1", "user1@example.com", "User One Verified")
+                }
+            }
+        }
+        val repo = DriveAccountRepository(dao, gateway, identityClient, dispatcher) { 7000L }
+
+        val step1 = repo.beginInteractiveAuthorization(DriveAuthFlowPurpose.REVERIFY)
+        val pendingRequest = (step1 as DriveAuthStepOutcome.NeedsResolution).pendingRequest
+
+        val job = launch(dispatcher) {
+            repo.completeAuthorizationFromIntent(
+                resultCodeOk = true,
+                hasData = true,
+                pendingRequest = pendingRequest,
+                extractResult = { gateway.extractAuthorizationResultFromIntent(Intent()) }
+            )
+        }
+        enteredHttp.await()
+        assertTrue(repo.observeSessionAuthState().first() is DriveSessionAuthState.InProgress)
+
+        job.cancelAndJoin()
+        assertTrue(job.isCancelled)
+
+        // Stato non deve restare InProgress, Room conservato e lastPersistedOutcome NON sovrascritto
+        val stateAfterCancel = repo.observeSessionAuthState().first()
+        assertTrue(stateAfterCancel is DriveSessionAuthState.LinkedUnverifiedInSession)
+        val persisted = dao.getAccount()!!
+        assertEquals("perm-1", persisted.permissionId)
+        assertEquals(PersistedDriveCheckOutcome.LAST_CHECK_SUCCEEDED.name, persisted.lastPersistedOutcome)
+        assertEquals(0, dao.writeCount)
+
+        // Una nuova verifica può essere avviata immediatamente
+        val nextOutcome = repo.beginInteractiveAuthorization(DriveAuthFlowPurpose.REVERIFY)
+        assertTrue(nextOutcome is DriveAuthStepOutcome.Completed)
+        assertTrue(repo.observeSessionAuthState().first() is DriveSessionAuthState.VerifiedInSession)
+    }
+
+    @Test
+    fun cancellationDuringDisconnectWithRemoteRevoke_restoresNonDisconnectingPreservesRoomAndAllowsNextDisconnect() = runTest {
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        val dao = FakeLinkedDriveAccountDao(sampleEntity(permissionId = "perm-1", email = "revoke@example.com"))
+        val enteredRevoke = CompletableDeferred<Unit>()
+        val revokeGate = CompletableDeferred<DriveGatewayRevokeResult>()
+        var firstCall = true
+        val gateway = FakeDriveAuthGateway().apply {
+            customRevokeAccess = {
+                if (firstCall) {
+                    firstCall = false
+                    enteredRevoke.complete(Unit)
+                    revokeGate.await()
+                } else {
+                    DriveGatewayRevokeResult.Succeeded
+                }
+            }
+        }
+        val repo = DriveAccountRepository(dao, gateway, FakeDriveIdentityClient(), dispatcher)
+
+        val job = launch(dispatcher) {
+            repo.disconnectWithRemoteRevoke()
+        }
+        enteredRevoke.await()
+        assertTrue(repo.observeSessionAuthState().first() is DriveSessionAuthState.Disconnecting)
+
+        job.cancelAndJoin()
+        assertTrue(job.isCancelled)
+
+        // Non deve restare Disconnecting e la riga Room deve essere preservata
+        val stateAfterCancel = repo.observeSessionAuthState().first()
+        assertTrue(stateAfterCancel is DriveSessionAuthState.LinkedUnverifiedInSession)
+        assertNotNull(dao.getAccount())
+        assertEquals("perm-1", dao.getAccount()?.permissionId)
+        assertEquals(0, dao.writeCount)
+
+        // Una successiva disconnessione legittima completa regolarmente
+        val secondOutcome = repo.disconnectWithRemoteRevoke()
+        assertEquals(DriveDisconnectOutcome.RemoteRevokeSucceeded, secondOutcome)
+        assertNull(dao.getAccount())
+        assertEquals(DriveSessionAuthState.NotLinked, repo.observeSessionAuthState().first())
+    }
+
+    @Test
+    fun cancellationRightAfterRemoteRevokeSucceeded_finishesSafeLocalCleanupWithoutStayingDisconnecting() = runTest {
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        val dao = FakeLinkedDriveAccountDao(sampleEntity(permissionId = "perm-1", email = "postrevoke@example.com"))
+        lateinit var cancelTargetJob: kotlinx.coroutines.Job
+        val gateway = FakeDriveAuthGateway().apply {
+            customRevokeAccess = {
+                // Simula cancellazione concorrente mentre la revoca Google è appena terminata con successo
+                cancelTargetJob.cancel()
+                DriveGatewayRevokeResult.Succeeded
+            }
+            interactiveQueue.addLast(
+                DriveGatewayAuthResult.Authorized("tok-new-link", listOf(DriveOAuthConstants.DRIVE_FILE_SCOPE))
+            )
+        }
+        val identityClient = FakeDriveIdentityClient().apply {
+            responses.addLast(Result.success(DriveUserIdentity("perm-new-2", "new2@example.com", "New Two")))
+        }
+        val repo = DriveAccountRepository(dao, gateway, identityClient, dispatcher)
+
+        cancelTargetJob = launch(dispatcher) {
+            repo.disconnectWithRemoteRevoke()
+        }
+        cancelTargetJob.join()
+
+        assertTrue(cancelTargetJob.isCancelled)
+        assertNull(dao.getAccount())
+        assertEquals(DriveSessionAuthState.NotLinked, repo.observeSessionAuthState().first())
+
+        // Deve essere subito possibile collegare un nuovo account
+        val linkOutcome = repo.beginInteractiveAuthorization(DriveAuthFlowPurpose.INITIAL_LINK)
+        assertTrue(linkOutcome is DriveAuthStepOutcome.Completed)
+        assertEquals("perm-new-2", dao.getAccount()?.permissionId)
+    }
+
+    @Test
+    fun remoteRevokeSucceeded_whenLocalDeleteAllThrowsSqliteError_neverStaysDisconnecting_marksReauthRequired_andAllowsLocalDisconnect() = runTest {
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        val dao = FakeLinkedDriveAccountDao(
+            sampleEntity(
+                permissionId = "perm-1",
+                email = "cleanup-fail@example.com"
+            )
+        ).apply {
+            deleteAllException = SQLiteException("Simulated SQLite error on deleteAll")
+        }
+        val gateway = FakeDriveAuthGateway().apply {
+            revokeResult = DriveGatewayRevokeResult.Succeeded
+        }
+        val repo = DriveAccountRepository(dao, gateway, FakeDriveIdentityClient(), dispatcher)
+
+        val outcome = repo.disconnectWithRemoteRevoke()
+
+        assertTrue(outcome is DriveDisconnectOutcome.RemoteRevokeSucceededLocalCleanupFailed)
+        assertFalse(outcome is DriveDisconnectOutcome.RemoteRevokeFailed)
+        assertEquals(listOf("cleanup-fail@example.com"), gateway.revokedEmails)
+
+        val stateAfterError = repo.observeSessionAuthState().first()
+        assertFalse(stateAfterError is DriveSessionAuthState.Disconnecting)
+        assertFalse(stateAfterError is DriveSessionAuthState.VerifiedInSession)
+        assertTrue(stateAfterError is DriveSessionAuthState.ReauthRequired)
+
+        // La riga Room è preservata ma marcata REAUTH_REQUIRED, quindi non appare autorizzata
+        val preserved = dao.getAccount()
+        assertNotNull(preserved)
+        assertEquals("perm-1", preserved?.permissionId)
+        assertEquals(PersistedDriveCheckOutcome.REAUTH_REQUIRED.name, preserved?.lastPersistedOutcome)
+
+        // Anche una nuova istanza del repository osserva lo stato persistito come non verificato/REAUTH_REQUIRED
+        val freshRepo = DriveAccountRepository(dao, gateway, FakeDriveIdentityClient(), dispatcher)
+        val freshState = freshRepo.observeSessionAuthState().first()
+        assertTrue(freshState is DriveSessionAuthState.LinkedUnverifiedInSession)
+        assertEquals(
+            PersistedDriveCheckOutcome.REAUTH_REQUIRED,
+            (freshState as DriveSessionAuthState.LinkedUnverifiedInSession).account.lastPersistedOutcome
+        )
+
+        // Risolto il problema SQLite, l'utente può completare lo scollegamento esclusivamente locale
+        dao.deleteAllException = null
+        val localOutcome = repo.confirmLocalOnlyDisconnect()
+        assertEquals(DriveDisconnectOutcome.LocalUnlinkOnly, localOutcome)
+        assertNull(dao.getAccount())
+        assertEquals(DriveSessionAuthState.NotLinked, repo.observeSessionAuthState().first())
     }
 }

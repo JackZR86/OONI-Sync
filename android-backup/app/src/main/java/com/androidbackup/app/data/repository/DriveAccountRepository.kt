@@ -19,6 +19,9 @@ import com.androidbackup.app.data.model.PersistedDriveCheckOutcome
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.combine
@@ -159,6 +162,22 @@ class DriveAccountRepository(
         _runtimeOverlay.value = RuntimeAuthOverlay.InProgress(purpose)
     }
 
+    private fun enterDisconnecting() {
+        val current = _runtimeOverlay.value
+        if (!isBusyOverlay(current)) {
+            previousOverlayBeforeBusy = current
+        }
+        _runtimeOverlay.value = RuntimeAuthOverlay.Disconnecting
+    }
+
+    private suspend fun safeGetAccountForRestoreLocked(fallback: LinkedDriveAccount?): LinkedDriveAccount? {
+        return try {
+            linkedDriveAccountDao.getAccount()?.toDomainModel()
+        } catch (_: Exception) {
+            fallback
+        }
+    }
+
     private fun restoreNonBusyOverlay(fallbackAccount: LinkedDriveAccount?) {
         val prev = previousOverlayBeforeBusy
         _runtimeOverlay.value = when {
@@ -215,17 +234,32 @@ class DriveAccountRepository(
 
             enterInProgress(purpose)
 
-            val promptSelect = shouldPromptSelectAccount(purpose, pendingRequest.targetEmail)
-            val gatewayResult = authGateway.authorizeInteractive(
-                targetEmail = pendingRequest.targetEmail,
-                promptSelectAccount = promptSelect
-            )
+            var restoreOnCancellation = true
+            try {
+                val promptSelect = shouldPromptSelectAccount(purpose, pendingRequest.targetEmail)
+                val gatewayResult = authGateway.authorizeInteractive(
+                    targetEmail = pendingRequest.targetEmail,
+                    promptSelectAccount = promptSelect
+                )
 
-            completeWithGatewayResultLocked(
-                gatewayResult = gatewayResult,
-                request = pendingRequest,
-                existingAccount = existing
-            )
+                val outcome = completeWithGatewayResultLocked(
+                    gatewayResult = gatewayResult,
+                    request = pendingRequest,
+                    existingAccount = existing
+                )
+                if (outcome is DriveAuthStepOutcome.NeedsResolution) {
+                    restoreOnCancellation = false
+                }
+                outcome
+            } catch (c: CancellationException) {
+                if (restoreOnCancellation) {
+                    withContext(NonCancellable) {
+                        val currentAccount = safeGetAccountForRestoreLocked(existing)
+                        restoreNonBusyOverlay(currentAccount)
+                    }
+                }
+                throw c
+            }
         }
     }
 
@@ -265,12 +299,27 @@ class DriveAccountRepository(
             // Assicura stato InProgress durante la verifica network about.get
             enterInProgress(pendingRequest.purpose)
 
-            val extracted = extractResult()
-            completeWithGatewayResultLocked(
-                gatewayResult = extracted,
-                request = pendingRequest,
-                existingAccount = existing
-            )
+            var restoreOnCancellation = true
+            try {
+                val extracted = extractResult()
+                val outcome = completeWithGatewayResultLocked(
+                    gatewayResult = extracted,
+                    request = pendingRequest,
+                    existingAccount = existing
+                )
+                if (outcome is DriveAuthStepOutcome.NeedsResolution) {
+                    restoreOnCancellation = false
+                }
+                outcome
+            } catch (c: CancellationException) {
+                if (restoreOnCancellation) {
+                    withContext(NonCancellable) {
+                        val currentAccount = safeGetAccountForRestoreLocked(existing)
+                        restoreNonBusyOverlay(currentAccount)
+                    }
+                }
+                throw c
+            }
         }
     }
 
@@ -738,21 +787,87 @@ class DriveAccountRepository(
                     "Indirizzo email non disponibile: è consentito esclusivamente lo scollegamento locale esplicito."
                 )
 
-            previousOverlayBeforeBusy = _runtimeOverlay.value
-            _runtimeOverlay.value = RuntimeAuthOverlay.Disconnecting
+            enterDisconnecting()
+            var remoteRevokeSucceeded = false
+            try {
+                when (val result = authGateway.revokeAccess(email)) {
+                    DriveGatewayRevokeResult.Succeeded -> {
+                        remoteRevokeSucceeded = true
+                        val localCleanupError = withContext(NonCancellable) {
+                            try {
+                                linkedDriveAccountDao.deleteAll()
+                                _runtimeOverlay.value = RuntimeAuthOverlay.UnverifiedInSession
+                                null
+                            } catch (c: CancellationException) {
+                                throw c
+                            } catch (e: Exception) {
+                                val detail = e.message?.takeIf { it.isNotBlank() }?.let { " ($it)" } ?: ""
+                                val cleanupMessage =
+                                    "Revoca remota su Google riuscita, ma la rimozione locale dell'associazione è fallita$detail. Completa lo scollegamento locale."
+                                val remaining = safeGetAccountForRestoreLocked(existing)
+                                if (remaining != null) {
+                                    try {
+                                        linkedDriveAccountDao.updateVerificationOutcome(
+                                            outcome = PersistedDriveCheckOutcome.REAUTH_REQUIRED.name,
+                                            attemptAt = nowProvider(),
+                                            errorMessage = cleanupMessage
+                                        )
+                                    } catch (c: CancellationException) {
+                                        throw c
+                                    } catch (_: Exception) {
+                                        // Best-effort: l'errore di aggiornamento persistente non deve impedire il ripristino dello stato
+                                    }
+                                    _runtimeOverlay.value = RuntimeAuthOverlay.ReauthRequired(
+                                        remaining.permissionId,
+                                        cleanupMessage
+                                    )
+                                } else {
+                                    _runtimeOverlay.value = RuntimeAuthOverlay.UnverifiedInSession
+                                }
+                                cleanupMessage
+                            }
+                        }
+                        currentCoroutineContext().ensureActive()
+                        if (localCleanupError == null) {
+                            DriveDisconnectOutcome.RemoteRevokeSucceeded
+                        } else {
+                            DriveDisconnectOutcome.RemoteRevokeSucceededLocalCleanupFailed(localCleanupError)
+                        }
+                    }
 
-            when (val result = authGateway.revokeAccess(email)) {
-                DriveGatewayRevokeResult.Succeeded -> {
-                    linkedDriveAccountDao.deleteAll()
-                    _runtimeOverlay.value = RuntimeAuthOverlay.UnverifiedInSession
-                    DriveDisconnectOutcome.RemoteRevokeSucceeded
+                    is DriveGatewayRevokeResult.Failed -> {
+                        // NON cancellare automaticamente la riga Room
+                        restoreNonBusyOverlay(existing)
+                        DriveDisconnectOutcome.RemoteRevokeFailed(result.message)
+                    }
                 }
-
-                is DriveGatewayRevokeResult.Failed -> {
-                    // NON cancellare automaticamente la riga Room
-                    restoreNonBusyOverlay(existing)
-                    DriveDisconnectOutcome.RemoteRevokeFailed(result.message)
+            } catch (c: CancellationException) {
+                withContext(NonCancellable) {
+                    if (remoteRevokeSucceeded) {
+                        runCatching { linkedDriveAccountDao.deleteAll() }
+                        val remaining = safeGetAccountForRestoreLocked(null)
+                        if (remaining != null) {
+                            val recoveryMessage = "Revoca completata su Google; scollega localmente l'account."
+                            runCatching {
+                                linkedDriveAccountDao.updateVerificationOutcome(
+                                    outcome = PersistedDriveCheckOutcome.REAUTH_REQUIRED.name,
+                                    attemptAt = nowProvider(),
+                                    errorMessage = recoveryMessage
+                                )
+                            }
+                            _runtimeOverlay.value = RuntimeAuthOverlay.ReauthRequired(
+                                remaining.permissionId,
+                                recoveryMessage
+                            )
+                        } else {
+                            _runtimeOverlay.value = RuntimeAuthOverlay.UnverifiedInSession
+                        }
+                    } else {
+                        val currentAccount = safeGetAccountForRestoreLocked(existing)
+                        restoreNonBusyOverlay(currentAccount)
+                    }
                 }
+                throw c
             }
         }
     }
