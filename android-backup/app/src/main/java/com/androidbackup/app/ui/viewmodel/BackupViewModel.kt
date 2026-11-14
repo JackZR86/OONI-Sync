@@ -1,22 +1,31 @@
 package com.androidbackup.app.ui.viewmodel
 
+import android.app.Activity
+import android.content.Intent
 import android.net.Uri
+import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.androidbackup.app.BuildConfig
 import com.androidbackup.app.data.local.entity.ScanSessionEntity
 import com.androidbackup.app.data.local.entity.ScanSessionStatus
 import com.androidbackup.app.data.mock.MockDataProvider
 import com.androidbackup.app.data.model.*
+import com.androidbackup.app.data.repository.DriveAccountRepository
+import com.androidbackup.app.data.repository.DriveAuthStepOutcome
 import com.androidbackup.app.data.repository.FolderRepository
 import com.androidbackup.app.data.repository.PermissionCompensationFailedException
 import com.androidbackup.app.data.repository.PermissionReleaseException
 import com.androidbackup.app.data.repository.ScanRepository
 import com.androidbackup.app.data.repository.SettingsRepository
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
@@ -52,28 +61,45 @@ data class BackupUiState(
     val lastCompletedScanSession: ScanSessionEntity? = null,
     val folderInventoryMap: Map<String, FolderInventoryInfo> = emptyMap(),
     val isScanInProgress: Boolean = false,
-    val isScanPaused: Boolean = false
+    val isScanPaused: Boolean = false,
+
+    // Identità e autorizzazione Google Drive (Fase 1C.1)
+    val driveSessionAuthState: DriveSessionAuthState = DriveSessionAuthState.Initializing,
+    val driveFeedbackMessage: String? = null,
+    val driveErrorMessage: String? = null,
+    val driveRemoteRevokeFailedMessage: String? = null
 )
 
 /**
- * ViewModel principale per Android Backup con integrazione persistenza Room, gestione permessi SAF
- * e motore di scansione ricorsiva locale dell'inventario file (Fase 1B.2).
+ * ViewModel principale per Android Backup con integrazione persistenza Room, gestione permessi SAF,
+ * motore di scansione ricorsiva locale e identità/autorizzazione Google Drive (Fase 1C.1).
  */
 class BackupViewModel(
     private val settingsRepository: SettingsRepository,
     private val folderRepository: FolderRepository? = null,
-    private val scanRepository: ScanRepository? = null
+    private val scanRepository: ScanRepository? = null,
+    private val driveAccountRepository: DriveAccountRepository? = null,
+    private val savedStateHandle: SavedStateHandle = SavedStateHandle()
 ) : ViewModel() {
 
     // Costruttori secondari per compatibilità con i test unitari focalizzati su specifiche porzioni
-    constructor(settingsRepository: SettingsRepository) : this(settingsRepository, null, null)
-    constructor(settingsRepository: SettingsRepository, folderRepository: FolderRepository?) : this(settingsRepository, folderRepository, null)
+    constructor(settingsRepository: SettingsRepository) : this(settingsRepository, null, null, null, SavedStateHandle())
+    constructor(settingsRepository: SettingsRepository, folderRepository: FolderRepository?) : this(settingsRepository, folderRepository, null, null, SavedStateHandle())
+    constructor(
+        settingsRepository: SettingsRepository,
+        folderRepository: FolderRepository?,
+        scanRepository: ScanRepository?
+    ) : this(settingsRepository, folderRepository, scanRepository, null, SavedStateHandle())
 
     private val _uiState = MutableStateFlow(BackupUiState())
     val uiState: StateFlow<BackupUiState> = _uiState.asStateFlow()
 
+    private val _driveAuthEvents = Channel<DriveAuthUiEvent>(Channel.BUFFERED)
+    val driveAuthEvents: Flow<DriveAuthUiEvent> = _driveAuthEvents.receiveAsFlow()
+
     private val _realFolders = MutableStateFlow<List<BackupSource>>(emptyList())
     private var simulationJob: Job? = null
+    private var isDriveOperationDispatching = false
 
     init {
         // 1. Osserva costantemente le impostazioni reali dal repository Room
@@ -123,6 +149,34 @@ class BackupViewModel(
                 scanRepository.latestCompletedSessionFlow.collect { completedSession ->
                     _uiState.update { it.copy(lastCompletedScanSession = completedSession) }
                     refreshFolderStats()
+                }
+            }
+        }
+
+        // 4. Osserva reattivamente lo stato Google Drive (Room + sessione corrente + SavedStateHandle)
+        if (driveAccountRepository == null) {
+            _uiState.update { it.copy(driveSessionAuthState = DriveSessionAuthState.NotLinked) }
+        } else {
+            viewModelScope.launch {
+                kotlinx.coroutines.flow.combine(
+                    driveAccountRepository.observeSessionAuthState(),
+                    savedStateHandle.getStateFlow<String?>(KEY_PENDING_AUTH_PURPOSE, null)
+                ) { repoState, _ ->
+                    val restoredPending = readPendingDriveAuthRequest()
+                    if (
+                        restoredPending != null &&
+                        repoState !is DriveSessionAuthState.InProgress &&
+                        repoState !is DriveSessionAuthState.Disconnecting
+                    ) {
+                        DriveSessionAuthState.InProgress(
+                            purpose = restoredPending.purpose,
+                            existingAccount = extractAccountFromSessionState(repoState)
+                        )
+                    } else {
+                        repoState
+                    }
+                }.collect { effectiveState ->
+                    _uiState.update { it.copy(driveSessionAuthState = effectiveState) }
                 }
             }
         }
@@ -706,5 +760,350 @@ class BackupViewModel(
 
     fun setLogSearchQuery(query: String) {
         _uiState.update { it.copy(logSearchQuery = query) }
+    }
+
+    // ==========================================
+    // IDENTITÀ E AUTORIZZAZIONE GOOGLE DRIVE (Fase 1C.1)
+    // ==========================================
+
+    fun connectDriveAccount() {
+        startInteractiveDriveFlow(DriveAuthFlowPurpose.INITIAL_LINK)
+    }
+
+    fun verifyDriveConnection() {
+        startInteractiveDriveFlow(DriveAuthFlowPurpose.REVERIFY)
+    }
+
+    fun switchDriveAccount() {
+        startInteractiveDriveFlow(DriveAuthFlowPurpose.SWITCH_ACCOUNT)
+    }
+
+    private fun startInteractiveDriveFlow(purpose: DriveAuthFlowPurpose) {
+        if (_uiState.value.isDemoMode) return
+        val repo = driveAccountRepository ?: return
+        if (isDriveFlowBusy()) return
+
+        val existingAccount = extractAccountFromSessionState(_uiState.value.driveSessionAuthState)
+        val initialRequest = PendingDriveAuthRequest(
+            purpose = purpose,
+            expectedPermissionId = existingAccount?.permissionId,
+            targetEmail = if (purpose == DriveAuthFlowPurpose.REVERIFY) existingAccount?.emailAddress else null,
+            retryUsed = false
+        )
+
+        isDriveOperationDispatching = true
+        savePendingDriveAuthRequest(initialRequest)
+        _uiState.update {
+            it.copy(
+                driveFeedbackMessage = null,
+                driveErrorMessage = null,
+                driveRemoteRevokeFailedMessage = null
+            )
+        }
+
+        viewModelScope.launch {
+            try {
+                val outcome = repo.beginInteractiveAuthorization(purpose)
+                handleDriveAuthStepOutcome(outcome)
+            } finally {
+                isDriveOperationDispatching = false
+            }
+        }
+    }
+
+    fun onDriveAuthorizationActivityResult(resultCode: Int, data: Intent?) {
+        if (_uiState.value.isDemoMode) {
+            clearPendingDriveAuthRequest()
+            return
+        }
+        val repo = driveAccountRepository ?: return
+        val pendingRequest = readPendingDriveAuthRequest()
+        clearPendingDriveAuthRequest()
+
+        isDriveOperationDispatching = true
+        viewModelScope.launch {
+            try {
+                val outcome = repo.completeAuthorizationFromIntent(
+                    resultCodeOk = (resultCode == Activity.RESULT_OK),
+                    hasData = (data != null),
+                    pendingRequest = pendingRequest,
+                    extractResult = { repo.extractAuthorizationResult(data) }
+                )
+                handleDriveAuthStepOutcome(outcome)
+            } finally {
+                isDriveOperationDispatching = false
+            }
+        }
+    }
+
+    fun onDrivePendingIntentLaunchFailed(reason: String?) {
+        clearPendingDriveAuthRequest()
+        val repo = driveAccountRepository ?: return
+        val message = reason?.takeIf { it.isNotBlank() }
+            ?: "Impossibile avviare la schermata di autorizzazione Google."
+        viewModelScope.launch {
+            repo.cancelPendingFlowAfterLaunchFailure(message)
+            _uiState.update { it.copy(driveErrorMessage = message) }
+        }
+    }
+
+    private suspend fun handleDriveAuthStepOutcome(outcome: DriveAuthStepOutcome) {
+        when (outcome) {
+            is DriveAuthStepOutcome.NeedsResolution -> {
+                // Conserva stato ricostruibile (scopo, identità attesa e retryUsed) in SavedStateHandle;
+                // la PendingIntent passa solo come evento one-shot.
+                savePendingDriveAuthRequest(outcome.pendingRequest)
+                _uiState.update {
+                    it.copy(
+                        driveSessionAuthState = DriveSessionAuthState.InProgress(
+                            purpose = outcome.pendingRequest.purpose,
+                            existingAccount = extractAccountFromSessionState(it.driveSessionAuthState)
+                        )
+                    )
+                }
+                _driveAuthEvents.send(DriveAuthUiEvent.LaunchAuthorizationIntent(outcome.intentSender))
+            }
+
+            is DriveAuthStepOutcome.Completed -> {
+                clearPendingDriveAuthRequest()
+                val msg = if (outcome.replacedExisting) {
+                    "Account Google Drive sostituito e verificato: ${outcome.account.primaryDisplayLabel()}."
+                } else {
+                    "Account Google Drive verificato nella sessione corrente: ${outcome.account.primaryDisplayLabel()}."
+                }
+                _uiState.update {
+                    it.copy(
+                        driveFeedbackMessage = msg,
+                        driveErrorMessage = null,
+                        driveRemoteRevokeFailedMessage = null
+                    )
+                }
+            }
+
+            is DriveAuthStepOutcome.Cancelled -> {
+                clearPendingDriveAuthRequest()
+                _uiState.update {
+                    it.copy(
+                        driveFeedbackMessage = outcome.message,
+                        driveErrorMessage = null
+                    )
+                }
+            }
+
+            is DriveAuthStepOutcome.Failed -> {
+                clearPendingDriveAuthRequest()
+                _uiState.update {
+                    it.copy(
+                        driveErrorMessage = outcome.reason,
+                        driveFeedbackMessage = null
+                    )
+                }
+            }
+
+            DriveAuthStepOutcome.BusyRejected -> {
+                // Non sovrascrive lo stato dell'operazione già in corso
+            }
+        }
+    }
+
+    fun disconnectDriveAccountWithRemoteRevoke() {
+        if (_uiState.value.isDemoMode) return
+        val repo = driveAccountRepository ?: return
+        if (isDriveFlowBusy()) return
+
+        isDriveOperationDispatching = true
+        _uiState.update {
+            it.copy(
+                driveFeedbackMessage = null,
+                driveErrorMessage = null,
+                driveRemoteRevokeFailedMessage = null
+            )
+        }
+
+        viewModelScope.launch {
+            try {
+                when (val outcome = repo.disconnectWithRemoteRevoke()) {
+                    DriveDisconnectOutcome.RemoteRevokeSucceeded -> {
+                        _uiState.update {
+                            it.copy(
+                                driveFeedbackMessage = "Accesso Google Drive revocato e account scollegato.",
+                                driveErrorMessage = null,
+                                driveRemoteRevokeFailedMessage = null
+                            )
+                        }
+                    }
+
+                    is DriveDisconnectOutcome.RemoteRevokeFailed -> {
+                        _uiState.update {
+                            it.copy(
+                                driveRemoteRevokeFailedMessage = outcome.reason,
+                                driveFeedbackMessage = null
+                            )
+                        }
+                    }
+
+                    DriveDisconnectOutcome.LocalUnlinkOnly -> {
+                        _uiState.update {
+                            it.copy(
+                                driveFeedbackMessage = "Associazione locale rimossa. L'autorizzazione Google potrebbe restare attiva nelle impostazioni del tuo Account Google.",
+                                driveRemoteRevokeFailedMessage = null
+                            )
+                        }
+                    }
+                }
+            } finally {
+                isDriveOperationDispatching = false
+            }
+        }
+    }
+
+    fun confirmLocalOnlyDriveDisconnect() {
+        if (_uiState.value.isDemoMode) return
+        val repo = driveAccountRepository ?: return
+        if (isDriveFlowBusy()) return
+
+        isDriveOperationDispatching = true
+        _uiState.update {
+            it.copy(
+                driveFeedbackMessage = null,
+                driveErrorMessage = null,
+                driveRemoteRevokeFailedMessage = null
+            )
+        }
+
+        viewModelScope.launch {
+            try {
+                repo.confirmLocalOnlyDisconnect()
+                _uiState.update {
+                    it.copy(
+                        driveFeedbackMessage = "Account scollegato solo localmente. Puoi revocare manualmente l'accesso dalle impostazioni di sicurezza del tuo Account Google.",
+                        driveErrorMessage = null,
+                        driveRemoteRevokeFailedMessage = null
+                    )
+                }
+            } finally {
+                isDriveOperationDispatching = false
+            }
+        }
+    }
+
+    fun runDebugSilentDriveTokenCheck() {
+        if (!BuildConfig.DEBUG) return
+        if (_uiState.value.isDemoMode) return
+        val repo = driveAccountRepository ?: return
+        if (isDriveFlowBusy()) return
+
+        isDriveOperationDispatching = true
+        _uiState.update {
+            it.copy(
+                driveFeedbackMessage = null,
+                driveErrorMessage = null
+            )
+        }
+
+        viewModelScope.launch {
+            try {
+                when (val outcome = repo.runSilentTokenCheckNoUi()) {
+                    is DebugSilentTokenCheckOutcome.Success -> {
+                        _uiState.update {
+                            it.copy(
+                                driveFeedbackMessage = outcome.message,
+                                driveErrorMessage = null
+                            )
+                        }
+                    }
+
+                    is DebugSilentTokenCheckOutcome.InteractionRequired -> {
+                        _uiState.update {
+                            it.copy(
+                                driveErrorMessage = outcome.message,
+                                driveFeedbackMessage = null
+                            )
+                        }
+                    }
+
+                    is DebugSilentTokenCheckOutcome.Failed -> {
+                        _uiState.update {
+                            it.copy(
+                                driveErrorMessage = outcome.message,
+                                driveFeedbackMessage = null
+                            )
+                        }
+                    }
+                }
+            } finally {
+                isDriveOperationDispatching = false
+            }
+        }
+    }
+
+    fun clearDriveMessages() {
+        _uiState.update {
+            it.copy(
+                driveFeedbackMessage = null,
+                driveErrorMessage = null,
+                driveRemoteRevokeFailedMessage = null
+            )
+        }
+    }
+
+    private fun isDriveFlowBusy(): Boolean {
+        if (isDriveOperationDispatching) return true
+        val state = _uiState.value.driveSessionAuthState
+        if (state is DriveSessionAuthState.Initializing ||
+            state is DriveSessionAuthState.InProgress ||
+            state is DriveSessionAuthState.Disconnecting
+        ) {
+            return true
+        }
+        return readPendingDriveAuthRequest() != null
+    }
+
+    private fun savePendingDriveAuthRequest(request: PendingDriveAuthRequest) {
+        savedStateHandle[KEY_PENDING_AUTH_PURPOSE] = request.purpose.name
+        savedStateHandle[KEY_PENDING_EXPECTED_PERMISSION_ID] = request.expectedPermissionId
+        savedStateHandle[KEY_PENDING_TARGET_EMAIL] = request.targetEmail
+        savedStateHandle[KEY_PENDING_RETRY_USED] = request.retryUsed
+    }
+
+    private fun readPendingDriveAuthRequest(): PendingDriveAuthRequest? {
+        val purposeName: String = savedStateHandle[KEY_PENDING_AUTH_PURPOSE] ?: return null
+        val purpose = try {
+            DriveAuthFlowPurpose.valueOf(purposeName)
+        } catch (_: IllegalArgumentException) {
+            return null
+        }
+        return PendingDriveAuthRequest(
+            purpose = purpose,
+            expectedPermissionId = savedStateHandle[KEY_PENDING_EXPECTED_PERMISSION_ID],
+            targetEmail = savedStateHandle[KEY_PENDING_TARGET_EMAIL],
+            retryUsed = savedStateHandle.get<Boolean>(KEY_PENDING_RETRY_USED) ?: false
+        )
+    }
+
+    private fun clearPendingDriveAuthRequest() {
+        savedStateHandle.remove<String>(KEY_PENDING_AUTH_PURPOSE)
+        savedStateHandle.remove<String>(KEY_PENDING_EXPECTED_PERMISSION_ID)
+        savedStateHandle.remove<String>(KEY_PENDING_TARGET_EMAIL)
+        savedStateHandle.remove<Boolean>(KEY_PENDING_RETRY_USED)
+    }
+
+    private fun extractAccountFromSessionState(state: DriveSessionAuthState): LinkedDriveAccount? {
+        return when (state) {
+            DriveSessionAuthState.Initializing, DriveSessionAuthState.NotLinked -> null
+            is DriveSessionAuthState.LinkedUnverifiedInSession -> state.account
+            is DriveSessionAuthState.InProgress -> state.existingAccount
+            is DriveSessionAuthState.Disconnecting -> state.account
+            is DriveSessionAuthState.VerifiedInSession -> state.account
+            is DriveSessionAuthState.ReauthRequired -> state.account
+            is DriveSessionAuthState.LastVerificationFailed -> state.account
+        }
+    }
+
+    companion object {
+        internal const val KEY_PENDING_AUTH_PURPOSE = "drive_pending_auth_purpose"
+        internal const val KEY_PENDING_EXPECTED_PERMISSION_ID = "drive_pending_expected_permission_id"
+        internal const val KEY_PENDING_TARGET_EMAIL = "drive_pending_target_email"
+        internal const val KEY_PENDING_RETRY_USED = "drive_pending_retry_used"
     }
 }

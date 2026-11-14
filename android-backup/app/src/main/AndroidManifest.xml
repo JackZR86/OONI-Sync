@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- 
-      Fase 0: Solo interfaccia e scheletro UI.
-      Nessun permesso di rete, scrittura disco o Google Workspace API non necessario a questa fase.
-      Il backup è strettamente unidirezionale e non modificherà mai i file locali.
+    <!--
+      Fase 1C.1: Permesso INTERNET per la verifica dell'identità Google Drive (drive/v3/about).
+      Nessun accesso in scrittura ai file locali (backup strettamente unidirezionale).
     -->
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <application
         android:name=".BackupApplication"

@@ -1,5 +1,8 @@
 package com.androidbackup.app.ui.screens
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.IntentSenderRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -14,7 +17,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.androidbackup.app.data.model.BackupFrequency
+import com.androidbackup.app.data.model.DriveAuthUiEvent
 import com.androidbackup.app.data.model.NetworkPolicy
+import com.androidbackup.app.ui.components.DriveAccountCard
 import com.androidbackup.app.ui.viewmodel.BackupUiState
 import com.androidbackup.app.ui.viewmodel.BackupViewModel
 
@@ -28,6 +33,31 @@ fun RulesScreen(
     val scrollState = rememberScrollState()
     var newExclusionText by remember { mutableStateOf("") }
     var showFifoConfirmationDialog by remember { mutableStateOf(false) }
+
+    val driveAuthLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartIntentSenderForResult()
+    ) { activityResult ->
+        viewModel.onDriveAuthorizationActivityResult(
+            resultCode = activityResult.resultCode,
+            data = activityResult.data
+        )
+    }
+
+    LaunchedEffect(viewModel) {
+        viewModel.driveAuthEvents.collect { event ->
+            when (event) {
+                is DriveAuthUiEvent.LaunchAuthorizationIntent -> {
+                    try {
+                        driveAuthLauncher.launch(
+                            IntentSenderRequest.Builder(event.intentSender).build()
+                        )
+                    } catch (e: Exception) {
+                        viewModel.onDrivePendingIntentLaunchFailed(e.localizedMessage)
+                    }
+                }
+            }
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -60,6 +90,22 @@ fun RulesScreen(
                 .padding(horizontal = 16.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
+            // Sezione 0: Account Google Drive (Fase 1C.1)
+            DriveAccountCard(
+                isDemoMode = uiState.isDemoMode,
+                authState = uiState.driveSessionAuthState,
+                feedbackMessage = uiState.driveFeedbackMessage,
+                errorMessage = uiState.driveErrorMessage,
+                remoteRevokeFailedMessage = uiState.driveRemoteRevokeFailedMessage,
+                onConnectAccount = { viewModel.connectDriveAccount() },
+                onVerifyConnection = { viewModel.verifyDriveConnection() },
+                onSwitchAccount = { viewModel.switchDriveAccount() },
+                onDisconnectWithRemoteRevoke = { viewModel.disconnectDriveAccountWithRemoteRevoke() },
+                onConfirmLocalOnlyDisconnect = { viewModel.confirmLocalOnlyDriveDisconnect() },
+                onDebugSilentTokenCheck = { viewModel.runDebugSilentDriveTokenCheck() },
+                onDismissMessages = { viewModel.clearDriveMessages() }
+            )
+
             // Sezione 1: Frequenza automatica
             Card(
                 modifier = Modifier.fillMaxWidth(),

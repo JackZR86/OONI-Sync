@@ -2,7 +2,12 @@ package com.androidbackup.app
 
 import android.app.Application
 import androidx.room.withTransaction
+import com.androidbackup.app.data.drive.AndroidDriveAuthGateway
+import com.androidbackup.app.data.drive.DriveAuthGateway
+import com.androidbackup.app.data.drive.DriveIdentityClient
+import com.androidbackup.app.data.drive.HttpDriveIdentityClient
 import com.androidbackup.app.data.local.database.BackupDatabase
+import com.androidbackup.app.data.repository.DriveAccountRepository
 import com.androidbackup.app.data.repository.FolderLifecycleCoordinator
 import com.androidbackup.app.data.repository.FolderRepository
 import com.androidbackup.app.data.repository.ScanRepository
@@ -24,10 +29,10 @@ import kotlinx.coroutines.launch
 /**
  * Applicazione principale per Android Backup.
  *
- * Conforme alla Specifica Fase 1B.2 - 1B.3C:
- * - Inizializza istanze singleton di BackupDatabase (v4), SettingsRepository, FolderRepository e ScanRepository
+ * Conforme alla Specifica Fase 1B.2 - 1C.1:
+ * - Inizializza istanze singleton di BackupDatabase (v5), SettingsRepository, FolderRepository, ScanRepository e DriveAccountRepository
  * - Istanzia una sola volta [FolderLifecycleCoordinator] per serializzare avvio scansioni e rimozione cartelle
- * - Fornisce [SafTreeReader], [SafContentReader], [Sha256StreamHasher], [LocalFolderScanner] e [LocalFileFingerprinter]
+ * - Fornisce [SafTreeReader], [SafContentReader], [Sha256StreamHasher], [LocalFolderScanner], [LocalFileFingerprinter], [DriveAuthGateway] e [DriveIdentityClient]
  * - Inizializza impostazioni predefinite e controlla sessioni interrotte al lancio
  */
 class BackupApplication : Application() {
@@ -40,6 +45,22 @@ class BackupApplication : Application() {
 
     val settingsRepository: SettingsRepository by lazy {
         SettingsRepository(database.settingsDao())
+    }
+
+    val driveAuthGateway: DriveAuthGateway by lazy {
+        AndroidDriveAuthGateway(this)
+    }
+
+    val driveIdentityClient: DriveIdentityClient by lazy {
+        HttpDriveIdentityClient()
+    }
+
+    val driveAccountRepository: DriveAccountRepository by lazy {
+        DriveAccountRepository(
+            linkedDriveAccountDao = database.linkedDriveAccountDao(),
+            authGateway = driveAuthGateway,
+            identityClient = driveIdentityClient
+        )
     }
 
     val safPermissionManager: SafPermissionManager by lazy {

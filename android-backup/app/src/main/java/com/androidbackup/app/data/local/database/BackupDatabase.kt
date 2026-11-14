@@ -12,13 +12,13 @@ import com.androidbackup.app.data.local.entity.*
 /**
  * Database Room principale per Android Backup.
  *
- * Vincoli architetturali Fase 1B.3A:
- * - Versione 4 (migrazione incrementale non distruttiva da v3 tramite MIGRATION_3_4)
+ * Vincoli architetturali Fase 1C.1:
+ * - Versione 5 (migrazione incrementale non distruttiva da v4 tramite MIGRATION_4_5)
  * - File SQLite stabile: "android_backup.db"
  * - NESSUN allowMainThreadQueries() nell'ambiente di produzione
  * - NESSUN fallbackToDestructiveMigration()
- * - Preserva integralmente impostazioni v1, esclusioni v1, cartelle v2 e inventari/sessioni v3
- * - Nuova tabella persistente per cache SHA-256: file_fingerprints
+ * - Preserva integralmente tutti i dati v1-v4
+ * - Nuova tabella per metadati non segreti dell'account Google Drive: linked_drive_account
  */
 @Database(
     entities = [
@@ -29,9 +29,10 @@ import com.androidbackup.app.data.local.entity.*
         ScannedDocumentEntity::class,
         PendingDirectoryEntity::class,
         ScanErrorEntity::class,
-        FileFingerprintEntity::class
+        FileFingerprintEntity::class,
+        LinkedDriveAccountEntity::class
     ],
-    version = 4,
+    version = 5,
     exportSchema = true
 )
 abstract class BackupDatabase : RoomDatabase() {
@@ -43,6 +44,7 @@ abstract class BackupDatabase : RoomDatabase() {
     abstract fun pendingDirectoryDao(): PendingDirectoryDao
     abstract fun scanErrorDao(): ScanErrorDao
     abstract fun fileFingerprintDao(): FileFingerprintDao
+    abstract fun linkedDriveAccountDao(): LinkedDriveAccountDao
 
     companion object {
         const val DATABASE_NAME = "android_backup.db"
@@ -243,6 +245,32 @@ abstract class BackupDatabase : RoomDatabase() {
         }
 
         /**
+         * Migrazione esplicita e non distruttiva dalla Versione 4 alla Versione 5 (Fase 1C.1).
+         * Crea la tabella `linked_drive_account` per i metadati non segreti dell'account Google Drive.
+         */
+        val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `linked_drive_account` (
+                        `id` INTEGER NOT NULL,
+                        `permission_id` TEXT NOT NULL,
+                        `email_address` TEXT,
+                        `display_name` TEXT,
+                        `granted_scope` TEXT NOT NULL,
+                        `linked_at` INTEGER NOT NULL,
+                        `last_verified_at` INTEGER NOT NULL,
+                        `last_persisted_outcome` TEXT NOT NULL,
+                        `last_verification_attempt_at` INTEGER,
+                        `last_error_message` TEXT,
+                        PRIMARY KEY(`id`)
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
+
+        /**
          * Restituisce l'istanza singleton del database SQLite con migrazioni configurate.
          */
         fun getInstance(context: Context): BackupDatabase {
@@ -252,7 +280,7 @@ abstract class BackupDatabase : RoomDatabase() {
                     BackupDatabase::class.java,
                     DATABASE_NAME
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
                     .build()
                 INSTANCE = instance
                 instance

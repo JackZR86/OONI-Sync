@@ -20,14 +20,15 @@ import org.robolectric.annotation.Config
 import java.io.File
 
 /**
- * Test di migrazione Room Database per Android Backup (Fase 1B.2 + Fase 1B.3A).
+ * Test di migrazione Room Database per Android Backup (Fase 1B.2 + Fase 1B.3A + Fase 1C.1).
  *
  * Dimostra:
  * 1. Migrazione SQLite nativa 1 -> 2 (tabella backup_folders e indice univoco su tree_uri).
  * 2. Migrazione SQLite nativa 2 -> 3 (tabelle scan_sessions, scanned_documents, pending_directories, scan_errors con indici e vincoli).
  * 3. Migrazione SQLite nativa 3 -> 4 (nuova tabella file_fingerprints ed estensione non distruttiva di scan_sessions, scanned_documents, scan_errors).
- * 4. Preservazione integrale di tutti i dati preesistenti da v1, v2 e v3 con valori di default coerenti.
- * 5. Percorso completo di migrazione 1 -> 2 -> 3 -> 4 aperto con successo dal runtime di Room v4 e piena operatività di tutti e 7 i DAO.
+ * 4. Migrazione SQLite nativa 4 -> 5 (nuova tabella linked_drive_account per i metadati non segreti Google Drive).
+ * 5. Preservazione integrale di tutti i dati preesistenti da v1, v2, v3 e v4 con valori di default coerenti.
+ * 6. Percorso completo di migrazione 1 -> 2 -> 3 -> 4 -> 5 aperto con successo dal runtime di Room v5 e piena operatività di tutti gli 8 DAO.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(manifest = Config.NONE)
@@ -487,7 +488,86 @@ class DatabaseMigrationTest {
     }
 
     @Test
-    fun testFullMigrationPath1To2To3To4OpensSuccessfullyWithRoomV4AndAllDaosOperate() = runBlocking {
+    fun testMigration4To5PreservesExistingDataAndCreatesLinkedDriveAccountTable() {
+        val testTimestamp = 1733000000000L
+
+        // 1. Porta il database allo stato v4 eseguendo le migrazioni incrementali 1->2->3->4
+        BackupDatabase.MIGRATION_1_2.migrate(db)
+        BackupDatabase.MIGRATION_2_3.migrate(db)
+        BackupDatabase.MIGRATION_3_4.migrate(db)
+
+        // 2. Popola dati reali v1-v4
+        db.execSQL(
+            """
+            INSERT INTO app_settings (
+                id, frequency, network_policy, reserve_space_mb,
+                fifo_rotation_enabled, allow_cloud_only_eviction, require_charging, last_modified_timestamp
+            ) VALUES (
+                ${AppSettingsEntity.DEFAULT_ID}, 'TWENTY_FOUR_HOURS', 'WIFI_ONLY', 250,
+                0, 0, 1, $testTimestamp
+            )
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
+            INSERT INTO backup_folders (id, tree_uri, display_name, authority, added_timestamp, priority, protect_from_eviction, enabled)
+            VALUES ('folder-v4-1', 'content://test.auth/tree/docs', 'Docs', 'test.auth', $testTimestamp, 'ALTA', 1, 1)
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
+            INSERT INTO file_fingerprints (
+                id, backup_folder_id, document_id, document_uri, relative_path, mime_type,
+                size_bytes, last_modified_timestamp, computed_bytes, sha256_hex,
+                last_content_hashed_timestamp, last_metadata_matched_timestamp, last_seen_session_id
+            ) VALUES (
+                'fp-v4', 'folder-v4-1', 'doc-v4', 'content://test.auth/doc/v4', 'readme.txt', 'text/plain',
+                128, 1500, 128, 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+                $testTimestamp, $testTimestamp, 'sess-v4'
+            )
+            """.trimIndent()
+        )
+
+        // 3. Esegui MIGRATION_4_5
+        BackupDatabase.MIGRATION_4_5.migrate(db)
+
+        // 4. Verifica preservazione dati v4
+        val settingsCursor = db.query("SELECT reserve_space_mb FROM app_settings WHERE id = ${AppSettingsEntity.DEFAULT_ID}")
+        assertTrue(settingsCursor.moveToFirst())
+        assertEquals(250, settingsCursor.getInt(0))
+        settingsCursor.close()
+
+        val fpCursor = db.query("SELECT sha256_hex FROM file_fingerprints WHERE id = 'fp-v4'")
+        assertTrue(fpCursor.moveToFirst())
+        assertEquals("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", fpCursor.getString(0))
+        fpCursor.close()
+
+        // 5. Verifica inserimento in linked_drive_account con campi email_address e display_name nullable
+        db.execSQL(
+            """
+            INSERT INTO linked_drive_account (
+                id, permission_id, email_address, display_name, granted_scope,
+                linked_at, last_verified_at, last_persisted_outcome, last_verification_attempt_at, last_error_message
+            ) VALUES (
+                ${LinkedDriveAccountEntity.DEFAULT_ID}, 'perm-001', NULL, NULL,
+                'https://www.googleapis.com/auth/drive.file', $testTimestamp, $testTimestamp,
+                'LAST_CHECK_SUCCEEDED', $testTimestamp, NULL
+            )
+            """.trimIndent()
+        )
+
+        val accountCursor = db.query("SELECT permission_id, email_address, display_name, granted_scope, last_persisted_outcome FROM linked_drive_account WHERE id = 1")
+        assertTrue(accountCursor.moveToFirst())
+        assertEquals("perm-001", accountCursor.getString(0))
+        assertTrue(accountCursor.isNull(1))
+        assertTrue(accountCursor.isNull(2))
+        assertEquals("https://www.googleapis.com/auth/drive.file", accountCursor.getString(3))
+        assertEquals("LAST_CHECK_SUCCEEDED", accountCursor.getString(4))
+        accountCursor.close()
+    }
+
+    @Test
+    fun testFullMigrationPath1To2To3To4To5OpensSuccessfullyWithRoomV5AndAllDaosOperate() = runBlocking {
         val testTimestamp = 1730005555555L
 
         // 1. Popola i dati v1 prima della migrazione
@@ -508,7 +588,7 @@ class DatabaseMigrationTest {
         db.close()
         openHelper.close()
 
-        // 2. Apri il database v1 con Room runtime v4 applicando MIGRATION_1_2, MIGRATION_2_3 e MIGRATION_3_4
+        // 2. Apri il database v1 con Room runtime v5 applicando tutte le migrazioni 1->2->3->4->5
         val roomDb = Room.databaseBuilder(
             context,
             BackupDatabase::class.java,
@@ -517,7 +597,8 @@ class DatabaseMigrationTest {
             .addMigrations(
                 BackupDatabase.MIGRATION_1_2,
                 BackupDatabase.MIGRATION_2_3,
-                BackupDatabase.MIGRATION_3_4
+                BackupDatabase.MIGRATION_3_4,
+                BackupDatabase.MIGRATION_4_5
             )
             .allowMainThreadQueries()
             .build()
@@ -728,5 +809,63 @@ class DatabaseMigrationTest {
         val deletedByFolder = roomDb.fileFingerprintDao().deleteByFolderId("room-migrated-1")
         assertEquals(1, deletedByFolder)
         assertEquals(0, roomDb.fileFingerprintDao().countByFolder("room-migrated-1"))
+
+        // 11. Verifica LinkedDriveAccountDao v5 (persistenza account, nullable email/name, sostituzione atomica e fallback enum)
+        val driveDao = roomDb.linkedDriveAccountDao()
+        assertNull(driveDao.getAccount())
+
+        val initialDriveEntity = LinkedDriveAccountEntity(
+            id = LinkedDriveAccountEntity.DEFAULT_ID,
+            permissionId = "perm-alice-123",
+            emailAddress = "alice@example.com",
+            displayName = "Alice",
+            grantedScope = "https://www.googleapis.com/auth/drive.file",
+            linkedAt = 1000L,
+            lastVerifiedAt = 1000L,
+            lastPersistedOutcome = "LAST_CHECK_SUCCEEDED",
+            lastVerificationAttemptAt = 1000L,
+            lastErrorMessage = null
+        )
+        driveDao.replaceAccount(initialDriveEntity)
+        val loadedDrive = driveDao.getAccount()
+        assertNotNull(loadedDrive)
+        assertEquals("perm-alice-123", loadedDrive!!.permissionId)
+        assertEquals("alice@example.com", loadedDrive.emailAddress)
+
+        driveDao.updateVerificationOutcome(
+            outcome = "REAUTH_REQUIRED",
+            attemptAt = 2500L,
+            errorMessage = "Token scaduto"
+        )
+        val updatedOutcomeDrive = driveDao.getAccount()!!
+        assertEquals("REAUTH_REQUIRED", updatedOutcomeDrive.lastPersistedOutcome)
+        assertEquals(2500L, updatedOutcomeDrive.lastVerificationAttemptAt)
+        assertEquals("Token scaduto", updatedOutcomeDrive.lastErrorMessage)
+
+        val nullableSecondAccount = LinkedDriveAccountEntity(
+            id = 99, // replaceAccount forza DEFAULT_ID e mantiene un solo record
+            permissionId = "perm-bob-999",
+            emailAddress = null,
+            displayName = null,
+            grantedScope = "https://www.googleapis.com/auth/drive.file",
+            linkedAt = 3000L,
+            lastVerifiedAt = 3000L,
+            lastPersistedOutcome = "UNKNOWN_FUTURE_ENUM",
+            lastVerificationAttemptAt = 3000L,
+            lastErrorMessage = null
+        )
+        driveDao.replaceAccount(nullableSecondAccount)
+        val replacedDrive = driveDao.getAccount()!!
+        assertEquals(LinkedDriveAccountEntity.DEFAULT_ID, replacedDrive.id)
+        assertEquals("perm-bob-999", replacedDrive.permissionId)
+        assertNull(replacedDrive.emailAddress)
+        assertNull(replacedDrive.displayName)
+        assertEquals(
+            com.androidbackup.app.data.model.PersistedDriveCheckOutcome.LAST_CHECK_FAILED,
+            replacedDrive.toDomainModel().lastPersistedOutcome
+        )
+
+        driveDao.deleteAll()
+        assertNull(driveDao.getAccount())
     }
 }
