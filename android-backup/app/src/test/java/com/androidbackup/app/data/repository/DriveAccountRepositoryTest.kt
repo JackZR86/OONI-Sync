@@ -22,6 +22,7 @@ import com.androidbackup.app.data.model.PendingDriveAuthRequest
 import com.androidbackup.app.data.model.PersistedDriveCheckOutcome
 import com.androidbackup.app.testutils.FakeLinkedDriveAccountDao
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.first
@@ -648,12 +649,14 @@ class DriveAccountRepositoryTest {
         }
         val repo = DriveAccountRepository(dao, gateway, identityClient, dispatcher)
 
-        cancelTargetJob = launch(dispatcher) {
+        cancelTargetJob = launch(dispatcher, start = CoroutineStart.LAZY) {
             repo.disconnectWithRemoteRevoke()
         }
+        cancelTargetJob.start()
         cancelTargetJob.join()
 
         assertTrue(cancelTargetJob.isCancelled)
+        assertEquals(listOf("postrevoke@example.com"), gateway.revokedEmails)
         assertNull(dao.getAccount())
         assertEquals(DriveSessionAuthState.NotLinked, repo.observeSessionAuthState().first())
 
