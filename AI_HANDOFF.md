@@ -63,19 +63,28 @@ Questo file è il punto di coordinamento condiviso per lo sviluppo di OONI-Sync.
 
 ## 5. Stato corrente e baseline ufficiale
 
-- **Fase completata e verificata:** **Fase 1B.3C — Integrazione del fingerprinting nella pipeline di scansione**.
-- **Commit ufficiale più recente (HEAD corrente di `main`):** `bd7a6f97bbafe5afb9edfdbe0f0cdcfe9b1c6534` (commit esclusivamente documentale su `AI_HANDOFF.md`).
-- **Baseline del codice Android verificata (non coincide con l'HEAD corrente):** `73b7c16537920dee3395c708360bafebef5e4431`. Non sono presenti modifiche applicative successive a questa baseline.
-- **Database:** Room schema v4, senza migrazioni pendenti.
+- **Fase implementata e verificata tramite CI:** **Fase 1C.1 — Autenticazione Google Drive e gestione dell'associazione account**.
+- **Commit ufficiale più recente (HEAD corrente di `main`):** `ae0f3674a8c1e997ee956aa704a771749e08982f`.
+- **Commit principali della Fase 1C.1:**
+  - `5b6354957691175c9122a1ce8887af3f8f8faf5e` — implementazione autenticazione Google Drive.
+  - `764a31d9a34250476150bccb66274a72e25773f8` — gestione esito revoca remota riuscita con pulizia locale fallita.
+  - `41c6352682a705754b12eac1240566f33155467b` — correzione race condition nel test di cancellazione.
+  - `ae0f3674a8c1e997ee956aa704a771749e08982f` — pubblicazione schema Room v5.
+- **Database:**
+  - Versione Room: 5.
+  - Migrazione incrementale v4→v5: `MIGRATION_4_5`.
+  - Schema esportato e versionato in: `android-backup/app/schemas/com.androidbackup.app.data.local.database.BackupDatabase/5.json`
+  - Identity hash: `dbd7c352079f13b1038915443113af95`
+  - Tabelle: 9, inclusa `linked_drive_account`.
 - **Stato CI (GitHub Actions):**
-  - **Run #12** su baseline codice Android (`73b7c16537920dee3395c708360bafebef5e4431`): successo (`:app:testDebugUnitTest`: 134 test superati; `:app:assembleDebug`: `BUILD SUCCESSFUL`; artifact dei report e APK debug generati e caricati).
-  - **Run #13** sul commit documentale (`bd7a6f97bbafe5afb9edfdbe0f0cdcfe9b1c6534`): successo (test e build APK completati con successo).
-- **Avanzamento:** nessuna nuova fase di sviluppo è ancora iniziata.
-- **Prossima attività:** qualsiasi nuova attività dovrà essere preceduta da una specifica progettuale approvata.
-
-### Riferimento storico (stato iniziale alla creazione del file — superato)
-
-- La precedente descrizione iniziale si riferiva alla **Fase 1B.3A — Database v4 e motore SHA-256 di base** (revisione rev3 sul commit `0958ed642a643fda10574e378a263dde0969fd7e`, ZIP con SHA-256 `7808fb1ed9b23a01b27e10d43b906d2cd4e7b7e57338b33c76f7542fa0504314`, interventi su `ScannedDocumentDao.kt`, `LocalFolderScanner.kt` e `LocalFolderScannerTest.kt`). Tali informazioni hanno valore esclusivamente storico e non rappresentano più lo stato corrente del repository.
+  - **Run #18** (Run ID: `43700657405`) su commit `ae0f3674a8c1e997ee956aa704a771749e08982f`: **SUCCESS**.
+  - Test unitari: 167 superati, 0 falliti, 0 ignorati.
+  - Build: `:app:assembleDebug` SUCCESSFUL.
+  - Report test e APK Debug caricati correttamente.
+  - Link CI: https://github.com/JackZR86/OONI-Sync/actions/runs/43700657405
+- **Attività ancora da svolgere / Prossimi passi:**
+  - Verifica manuale dell'APK Debug su dispositivo Android, in particolare collegamento, verifica account e scollegamento Google.
+  - **Fase 1C.2:** creazione e gestione della cartella dedicata OONI-Sync su Google Drive, da avviare solo dopo approvazione della relativa specifica.
 
 ## 6. Sicurezza e integrità
 
